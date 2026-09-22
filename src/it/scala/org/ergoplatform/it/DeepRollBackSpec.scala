@@ -5,9 +5,9 @@ import java.util.concurrent.TimeoutException
 import com.typesafe.config.{Config, ConfigFactory}
 import io.circe.Json
 import org.ergoplatform.it.api.NodeApi.{NodeInfo, nodeInfoDecoder}
-import org.ergoplatform.it.container.{IntegrationSuite, Node}
+import org.ergoplatform.it.container.{Docker, IntegrationSuite, Node}
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils
-import org.ergoplatform.it.util.ConvergenceObservations
+import org.ergoplatform.it.util.{ConvergenceObservations, ConvergenceWatch, NodeSample, PeerSyncStatus}
 import org.scalatest.freespec.AnyFreeSpec
 import scala.async.Async
 import scala.concurrent.{Await, Future}
@@ -48,9 +48,18 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     .withFallback(allowLocalConfig)
 
   private val observations = new ConvergenceObservations
-  private case class NodeSnapshot(info: Option[NodeInfo])
+  private val watches = scala.collection.mutable.ArrayBuffer.empty[ConvergenceWatch]
+
+  private case class NodeSnapshot(info: Option[NodeInfo], peers: Option[Int] = None, answered: Boolean = false,
+                                  syncStatuses: Option[Seq[PeerSyncStatus]] = None) {
+    def sample(node: Node, docker: Docker): NodeSample =
+      NodeSample(node.nodeName, System.currentTimeMillis(),
+        if (answered) NodeSample.Running else docker.containerState(node.nodeInfo.containerId), answered,
+        info.flatMap(_.bestHeaderHeightOpt), info.flatMap(_.bestBlockHeightOpt),
+        info.flatMap(_.bestHeaderIdOpt), info.flatMap(_.bestBlockIdOpt), peers, info.flatMap(_.isMining), syncStatuses)
+  }
   private val probes = scala.collection.mutable.Map.empty[
-    Node, (observations.Probe[NodeInfo], observations.Probe[Int])]
+    Node, (observations.Probe[NodeInfo], observations.Probe[Int], observations.Probe[Seq[PeerSyncStatus]])]
 
   @volatile private var lastObservation = "No node pair observed"
   private var recentObservations = Vector.empty[String]
@@ -63,7 +72,7 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
   }
 
   private def snapshot(phase: String, label: String, node: Node, budget: FiniteDuration): Future[NodeSnapshot] = {
-    val (statusProbe, peerProbe) = probes.getOrElseUpdate(node, (
+    val (statusProbe, peerProbe, syncProbe) = probes.getOrElseUpdate(node, (
       observations.probe(node.singleGet("/info", _.setRequestTimeout(5000))
         .map { r =>
           require(r.getStatusCode == 200, "Unexpected observation status")
@@ -73,6 +82,10 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
         require(r.getStatusCode == 200, "Unexpected observation status")
         node.ergoJsonAnswerAs[Json](r.getResponseBody).asArray.getOrElse(
           throw new IllegalArgumentException("Expected peer array")).size
+      }),
+      observations.probe(node.singleGet("/peers/syncInfo", _.setRequestTimeout(5000)).map { r =>
+        require(r.getStatusCode == 200, "Unexpected observation status")
+        PeerSyncStatus.fromJson(node.ergoJsonAnswerAs[Json](r.getResponseBody))
       })
     ))
     val status = statusProbe.sample(budget).map {
@@ -92,8 +105,15 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     val peers = peerProbe.sample(budget).map { result =>
       val summary = result.fold(error => s"errorClass=$error", count => s"connectedPeerCount=$count")
       remember(phase, label, "peers", summary)
+      result.toOption
     }
-    status.zip(peers).map { case (info, _) => NodeSnapshot(info) }
+    val sync = syncProbe.sample(budget).map { result =>
+      remember(phase, label, "syncInfo", result.fold(error => s"errorClass=$error", _.map(_.render).mkString("[", ",", "]")))
+      result.toOption
+    }
+    status.zip(peers).zip(sync).map { case ((info, peerCount), ratings) =>
+      NodeSnapshot(info, peerCount, answered = info.nonEmpty, ratings)
+    }
   }
 
   private def observeNodes(
@@ -111,14 +131,21 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     minHeight: Int,
     timeout: FiniteDuration
   ): Future[(NodeInfo, NodeInfo)] = {
-    observations.until(timeout.fromNow, 1.second, 5.seconds)(
-      budget => observeNodes("convergence", nodeA, nodeB, budget)
-    ) { case (a, b) =>
+    // names the cause of a miss (equal-height tie, headers ahead of full blocks, a node down, ...) from
+    // the observations this wait already makes; it issues no request of its own
+    val watch = new ConvergenceWatch(docker, Seq(nodeA, nodeB))
+    watches += watch
+    observations.until(timeout.fromNow, 1.second, 5.seconds) { budget =>
+      observeNodes("convergence", nodeA, nodeB, budget).map { case (a, b) =>
+        watch.record(Seq(a.sample(nodeA, docker), b.sample(nodeB, docker)))
+        (a, b)
+      }
+    } { case (a, b) =>
       a.info.exists(infoA => b.info.exists(infoB => ConvergenceObservations.sameBestBlock(infoA, infoB, minHeight)))
     }(
-      s"Nodes did not converge to the same best full block at height >= $minHeight; " +
-        s"recent observations: $lastObservation"
-    ).map { case (a, b) => (a.info.get, b.info.get) }
+      watch.report(s"Nodes did not converge to the same best full block at height >= $minHeight; " +
+        s"recent observations: $lastObservation")
+    ).map { case (a, b) => (a.info.get, b.info.get) }.andThen { case _ => watch.close() }
   }
 
   "Deep rollback handling" in {
@@ -214,6 +241,7 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
         log.error(s"Deep rollback timed out; last observation: $lastObservation")
         throw error
     } finally {
+      watches.foreach(_.close())
       observations.close()
     }
   }

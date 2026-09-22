@@ -3,7 +3,7 @@ package org.ergoplatform.it
 import com.typesafe.config.Config
 import io.circe.Json
 import org.ergoplatform.it.container.{IntegrationSuite, Node}
-import org.ergoplatform.it.util.{ConvergenceObservations, UtxoSyncFailureDiagnostics}
+import org.ergoplatform.it.util.{ConvergenceObservations, ConvergenceWatch, UtxoSyncFailureDiagnostics}
 import org.scalatest.flatspec.AnyFlatSpec
 
 import scala.concurrent.duration._
@@ -14,6 +14,7 @@ class UtxoStateNodesSyncSpec extends AnyFlatSpec with IntegrationSuite {
   val blocksQty = 5
 
   val forkDepth: Int      = blocksQty
+  protected def syncTimeout: FiniteDuration = 15.minutes
   val minerConfig: Config = nodeSeedConfigs.head
 
   val nonGeneratingConfig: Config =
@@ -29,8 +30,11 @@ class UtxoStateNodesSyncSpec extends AnyFlatSpec with IntegrationSuite {
   val nodes: List[Node] = docker.startDevNetNodes(nodeConfigs).get
 
   it should s"Utxo state nodes synchronisation ($blocksQty blocks)" in {
-    val deadline = 15.minutes.fromNow
+    val deadline = syncTimeout.fromNow
     val observations = new ConvergenceObservations
+    // heights, tip ids, peers and container state of every node, sampled for the whole wait, so a
+    // timeout anywhere in it (the height wait included) names its cause
+    val watch = new ConvergenceWatch(docker, nodes).startSampling()
     @volatile var recent = Vector.empty[String]
     val result = for {
       initHeight <- Future.traverse(nodes)(_.fullHeight).map(x => math.max(x.max, 1))
@@ -76,13 +80,17 @@ class UtxoStateNodesSyncSpec extends AnyFlatSpec with IntegrationSuite {
     catch {
       case error: java.util.concurrent.TimeoutException =>
         log.error(s"UTXO synchronization timed out; recent observations: ${recent.mkString("; ")}")
-        UtxoSyncFailureDiagnostics.rethrowAfterCapture(error, nodes.map { node => () =>
+        val diagnosed = new java.util.concurrent.TimeoutException(
+          watch.report(s"UTXO synchronization timed out (${error.getMessage})"))
+        diagnosed.initCause(error)
+        watch.close() // the post-failure capture below runs alone
+        UtxoSyncFailureDiagnostics.rethrowAfterCapture(diagnosed, nodes.map { node => () =>
           node.singleGet("/info", _.setRequestTimeout(2000)).map { response =>
             require(response.getStatusCode == 200, "Unexpected diagnostic status")
             node.ergoJsonAnswerAs[Json](response.getResponseBody)
           }
         })(snapshot => log.error(s"UTXO post-failure diagnostics: $snapshot"))
-    } finally observations.close()
+    } finally { watch.close(); observations.close() }
   }
 
 }
