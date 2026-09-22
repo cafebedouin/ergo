@@ -469,6 +469,27 @@ class Docker(
     }
   }
 
+  /** The last `lines` lines a container wrote; CI keeps no node log files, so failures quote this. */
+  def logTail(containerId: String, lines: Int = 15): String = {
+    val output = new StringBuffer
+    Try {
+      client.logContainerCmd(containerId).withStdOut(true).withStdErr(true).withTail(lines)
+        .exec(new ResultCallback.Adapter[Frame] {
+          override def onNext(frame: Frame): Unit = output.append(new String(frame.getPayload))
+        }).awaitCompletion(3, TimeUnit.SECONDS)
+    }
+    output.toString.trim
+  }
+
+  /** "running", "paused", "oom-killed" or "<status>(<exit code>)"; "unknown" if docker does not answer. */
+  def containerState(containerId: String): String =
+    Try(client.inspectContainerCmd(containerId).exec().getState).map { state =>
+      if (Option(state.getOOMKilled).exists(_.booleanValue)) "oom-killed"
+      else if (Option(state.getPaused).exists(_.booleanValue)) "paused"
+      else if (Option(state.getRunning).exists(_.booleanValue)) "running"
+      else s"${state.getStatus}(${state.getExitCodeLong})"
+    }.getOrElse("unknown")
+
   def disconnectFromNetwork(containerId: String): Unit =
     client
       .disconnectFromNetworkCmd()
