@@ -1,6 +1,30 @@
 package org.ergoplatform.it.util
 
+import io.circe.Json
+
 import scala.concurrent.duration._
+
+/**
+  * One entry of a node's `GET /peers/syncInfo`: how that node rates one peer's chain against its own
+  * (`Equal`, `Younger`, `Fork`, `Older`, `Nonsense`, `Unknown`) and the peer height it has recorded.
+  */
+final case class PeerSyncStatus(address: String, status: String, height: Option[Int]) {
+  def render: String = s"$status@${height.map(_.toString).getOrElse("-")}"
+}
+
+object PeerSyncStatus {
+  val Younger = "Younger"
+  val Older = "Older"
+
+  /** Parses the `/peers/syncInfo` array; an entry without a `status` is skipped, not guessed. */
+  def fromJson(json: Json): Seq[PeerSyncStatus] =
+    json.asArray.getOrElse(Vector.empty).flatMap { entry =>
+      val c = entry.hcursor
+      c.get[String]("status").toOption.map { status =>
+        PeerSyncStatus(c.get[String]("address").getOrElse("N/A"), status, c.get[Int]("height").toOption)
+      }
+    }
+}
 
 /**
   * One node's state at one sampling instant. `answered` says whether REST answered at all: a node at
@@ -15,7 +39,8 @@ final case class NodeSample(name: String,
                             bestHeaderId: Option[String],
                             bestFullId: Option[String],
                             peers: Option[Int],
-                            mining: Option[Boolean]) {
+                            mining: Option[Boolean],
+                            peerStatuses: Option[Seq[PeerSyncStatus]] = None) {
 
   /** A paused container still exists (silence, not death); an unanswered `inspect` proves nothing. */
   def running: Boolean =
@@ -31,8 +56,13 @@ final case class NodeSample(name: String,
     def num(v: Option[Int]): String = v.map(_.toString).getOrElse("-")
     s"$name[$containerState] headers=${num(headersHeight)}:${short(bestHeaderId)} " +
       s"full=${num(fullHeight)}:${short(bestFullId)} peers=${num(peers)} " +
-      s"mining=${mining.map(_.toString).getOrElse("-")}"
+      s"mining=${mining.map(_.toString).getOrElse("-")}" +
+      peerStatuses.map(ps => s" sync=[${ps.map(_.render).mkString(",")}]").getOrElse("")
   }
+
+  /** Whether this node rated some peer `status`; with a recorded peer height, it must also satisfy `height`. */
+  def rates(status: String)(height: Int => Boolean): Boolean =
+    peerStatuses.exists(_.exists(p => p.status == status && p.height.forall(height)))
 }
 
 object NodeSample {
@@ -63,6 +93,7 @@ object ConvergenceDiagnosis {
   val EqualHeightTie = "EQUAL_HEIGHT_TIE"
   val HeadersAheadFullStuck = "HEADERS_AHEAD_FULL_STUCK"
   val LighterForkNotSwitching = "LIGHTER_FORK_NOT_SWITCHING"
+  val SyncStatusDeadlock = "SYNC_STATUS_DEADLOCK"
   val ChainStalled = "CHAIN_STALLED"
   val StillProgressing = "STILL_PROGRESSING"
   val PersistentFork = "PERSISTENT_FORK"
@@ -199,6 +230,18 @@ object ConvergenceDiagnosis {
         n.fullHeight.nonEmpty && n.fullHeight == n.headersHeight && top.exists(t => n.fullHeight.exists(_ < t))
       }
       val frozen = f"no height moved for $spanSeconds%.0f s"
+      // `/peers/syncInfo` ratings (sampled only where a spec asks for them): a higher node that rates a lower
+      // peer Younger, and a lower node that rates a higher peer Older, in every retained round; a recorded
+      // peer height must sit on the rated side. It names the ratings, not which node should have acted.
+      val ratingRounds = history.takeRight(PersistRounds)
+      def heldEveryRound(name: String)(p: NodeSample => Boolean): Boolean =
+        ratingRounds.size >= 2 && ratingRounds.forall(_.find(_.name == name).exists(p))
+      val deadlocked = for {
+        h <- last if h.fullHeight.nonEmpty && h.fullHeight == top
+        l <- last if l.fullHeight.exists(lf => top.exists(lf < _))
+        if heldEveryRound(h.name)(n => n.rates(PeerSyncStatus.Younger)(ph => n.fullHeight.exists(ph < _)))
+        if heldEveryRound(l.name)(n => n.rates(PeerSyncStatus.Older)(ph => n.fullHeight.exists(ph > _)))
+      } yield (h, l)
 
       if (stuckBehindHeaders.nonEmpty) Diagnosis(HeadersAheadFullStuck,
         s"$frozen; headers ahead of full blocks on: ${stuckBehindHeaders.map(_.render).mkString("; ")}. All: $all")
@@ -206,6 +249,11 @@ object ConvergenceDiagnosis {
         s"$frozen; equal heights, different tips, mining=${if (anyoneMining) "on" else "off"}. " +
           (if (anyoneMining) "A miner is on and no block came. "
            else "No later block will break the tie while nobody mines. ") + "This does not say which node is wrong. " + all)
+      else if (tips.size > 1 && deadlocked.nonEmpty) Diagnosis(SyncStatusDeadlock,
+        s"$frozen; each side's rating leaves the other to act, for ${ratingRounds.size} rounds: " +
+          deadlocked.map { case (h, l) =>
+            s"${h.name} rates a lower peer ${PeerSyncStatus.Younger}, ${l.name} rates a higher peer ${PeerSyncStatus.Older}"
+          }.mkString("; ") + s". All: $all")
       else if (tips.size > 1 && lowerAndUnaware.nonEmpty) Diagnosis(LighterForkNotSwitching,
         s"$frozen; a lower node never took the higher chain's headers: " +
           s"${lowerAndUnaware.map(_.render).mkString("; ")}. All: $all")

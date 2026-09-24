@@ -10,7 +10,7 @@ import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future}
 
 /**
-  * Samples a group of nodes (REST state, peer count, container state), keeps the last rounds, and turns a
+  * Samples a group of nodes (REST state, peer count, per-peer sync ratings, container state), keeps the last rounds, and turns a
   * timeout into a named cause (see [[ConvergenceDiagnosis]]). A node that does not answer within the
   * budget yields an empty sample instead of failing the round.
   */
@@ -31,7 +31,11 @@ final class ConvergenceWatch(docker: Docker, nodes: Seq[Node], keep: FiniteDurat
       require(r.getStatusCode == 200, s"/peers/connected answered ${r.getStatusCode}")
       node.ergoJsonAnswerAs[Json](r.getResponseBody).asArray.map(_.size).getOrElse(0)
     })
-    (node, info, peers)
+    val syncInfo = observations.probe(node.singleGet("/peers/syncInfo", _.setRequestTimeout(5000)).map { r =>
+      require(r.getStatusCode == 200, s"/peers/syncInfo answered ${r.getStatusCode}")
+      PeerSyncStatus.fromJson(node.ergoJsonAnswerAs[Json](r.getResponseBody))
+    })
+    (node, info, peers, syncInfo)
   }
 
   def history: Seq[Seq[NodeSample]] = synchronized(rounds)
@@ -44,8 +48,8 @@ final class ConvergenceWatch(docker: Docker, nodes: Seq[Node], keep: FiniteDurat
 
   /** One round. With `withContainerState = false` the docker daemon is not asked (for fast polling). */
   def sample(budget: FiniteDuration = 3.seconds, withContainerState: Boolean = true): Future[Seq[NodeSample]] =
-    Future.traverse(probes) { case (node, infoProbe, peersProbe) =>
-      infoProbe.sample(budget).zip(peersProbe.sample(budget)).map { case (info, peers) =>
+    Future.traverse(probes) { case (node, infoProbe, peersProbe, syncProbe) =>
+      infoProbe.sample(budget).zip(peersProbe.sample(budget)).zip(syncProbe.sample(budget)).map { case ((info, peers), sync) =>
         val state =
           if (withContainerState || info.isLeft) docker.containerState(node.nodeInfo.containerId)
           else NodeSample.Running
@@ -53,7 +57,7 @@ final class ConvergenceWatch(docker: Docker, nodes: Seq[Node], keep: FiniteDurat
         NodeSample(node.nodeName, System.currentTimeMillis(), state, info.isRight,
           i.flatMap(_.bestHeaderHeightOpt), i.flatMap(_.bestBlockHeightOpt),
           i.flatMap(_.bestHeaderIdOpt), i.flatMap(_.bestBlockIdOpt),
-          peers.toOption, i.flatMap(_.isMining))
+          peers.toOption, i.flatMap(_.isMining), sync.toOption)
       }
     }.map { round =>
       synchronized {

@@ -49,6 +49,47 @@ class ConvergenceDiagnosisSpec extends AnyFlatSpec with Matchers {
     d.evidence should include("B[running]")
   }
 
+  "Sync ratings that leave each side to the other" should "be named a sync-status deadlock" in {
+    // CI 35775823953 (DeepRollBackSpec): A 256/256, B 70/70, one peer each; the ratings are the ones the
+    // #2535 review derived from the code for that state (the run did not sample them)
+    val a = node("A", 256, 256, "a256", "a256").copy(peerStatuses = Some(Seq(PeerSyncStatus("/172.18.0.3:9020", "Younger", Some(70)))))
+    val b = node("B", 70, 70, "b70", "b70").copy(peerStatuses = Some(Seq(PeerSyncStatus("/172.18.0.2:9020", "Older", Some(256)))))
+    val d = diagnose(frozen(Seq(a, b)))
+    d.cause shouldBe SyncStatusDeadlock
+    d.evidence should include("A rates a lower peer Younger, B rates a higher peer Older")
+    d.evidence should include("sync=[Older@256]")
+    // without ratings sampled, the same heights keep their earlier name
+    diagnose(frozen(Seq(a.copy(peerStatuses = None), b.copy(peerStatuses = None)))).cause shouldBe LighterForkNotSwitching
+  }
+
+  it should "not be named while heights are still moving" in {
+    val a = node("A", 256, 256, "a256", "a256").copy(peerStatuses = Some(Seq(PeerSyncStatus("b", "Younger", Some(70)))))
+    val b = node("B", 70, 70, "b70", "b70").copy(peerStatuses = Some(Seq(PeerSyncStatus("a", "Older", Some(256)))))
+    val moving = (0 until 5).map(i => Seq(
+      a.copy(atMillis = i * 10000L, headersHeight = Some(256 + 2 * i), fullHeight = Some(256 + 2 * i), bestFullId = Some(s"a$i")),
+      b.copy(atMillis = i * 10000L, headersHeight = Some(70 + 2 * i), fullHeight = Some(70 + 2 * i), bestFullId = Some(s"a$i"))))
+    diagnose(moving).cause should not be SyncStatusDeadlock
+  }
+
+  it should "not be named from one round of ratings, or from a rating whose height contradicts it" in {
+    val a = node("A", 256, 256, "a256", "a256"); val b = node("B", 70, 70, "b70", "b70")
+    val rated = Seq(a.copy(peerStatuses = Some(Seq(PeerSyncStatus("b", "Younger", Some(70))))),
+                    b.copy(peerStatuses = Some(Seq(PeerSyncStatus("a", "Older", Some(256))))))
+    val oneRound = frozen(Seq(a, b), 4) :+ rated.map(_.copy(atMillis = 40000L))
+    diagnose(oneRound).cause shouldBe LighterForkNotSwitching
+    // a peer rated Younger at a height above the rater's own is not the pattern
+    val contradicted = Seq(rated.head.copy(peerStatuses = Some(Seq(PeerSyncStatus("b", "Younger", Some(300))))), rated(1))
+    diagnose(frozen(contradicted)).cause shouldBe LighterForkNotSwitching
+  }
+
+  "A /peers/syncInfo answer" should "parse status and height, and skip entries without a status" in {
+    val json = io.circe.parser.parse(
+      """[{"address":"/172.18.0.3:9020","version":"6.0.6","mode":null,"status":"Younger","height":70},
+        | {"address":"/172.18.0.4:9020","version":"6.0.6","mode":null,"height":12}]""".stripMargin).toOption.get
+    PeerSyncStatus.fromJson(json) shouldBe Seq(PeerSyncStatus("/172.18.0.3:9020", "Younger", Some(70)))
+    PeerSyncStatus.fromJson(io.circe.Json.obj()) shouldBe empty
+  }
+
   it should "be named a stalled chain when tips agree" in {
     diagnose(frozen(Seq(node("A", 12, 12, "aa", "aa"), node("B", 12, 12, "aa", "aa")))).cause shouldBe ChainStalled
   }
