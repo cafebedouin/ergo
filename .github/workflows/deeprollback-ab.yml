@@ -5,6 +5,8 @@
 #   iso-anchor    + the genesis anchor in full V2 sync summaries (ErgoHistoryReader.syncInfoV2)
 #   iso-scanback  + the scan-back in nextModifiersToDownload (ToDownloadProcessor)
 #   iso-both      + both
+#   iso-clamp     + the clamp max(GenesisHeight, h - offset) in V2 sync summaries (jozanek's alternative to the anchor)
+#   iso-clamp-both + the clamp and the scan-back
 # Every run uploads the test reports and every container's log.
 name: DeepRollBackSpec A/B
 on:
@@ -18,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [ base, iso, iso-anchor, iso-scanback, iso-both ]
+        variant: [ iso-clamp, iso-clamp-both ]
         rep: [ 1, 2, 3, 4 ]
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +39,8 @@ jobs:
             iso-anchor) patches="iso anchor" ;;
             iso-scanback) patches="iso scanback" ;;
             iso-both) patches="iso anchor scanback" ;;
+            iso-clamp) patches="iso clamp" ;;
+            iso-clamp-both) patches="iso clamp scanback" ;;
           esac
           for p in $patches; do git apply ".ci/patches/$p.diff"; echo "applied $p"; done
           git diff --stat
