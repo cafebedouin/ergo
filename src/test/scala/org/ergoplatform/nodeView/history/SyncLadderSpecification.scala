@@ -89,4 +89,23 @@ class SyncLadderSpecification extends ErgoCorePropertyTest with NoShrink {
       (forkBase & toDownload).nonEmpty shouldBe true
     }
   }
+
+  property("once the heavier chain leads by more than 128, a node downloads its blocks below the near-tip lookback") {
+    var c = genHistory()
+    val common = genChain(100, c) // heights 1..100
+    c = applyChain(c, common)
+    val own = genChain(151, common.last).tail // C's own full chain, heights 101..251
+    c = applyChain(c, own)
+    Thread.sleep(2)
+    val heavier = genChain(281, common.last).tail // heights 101..381, headers only: fork 151 deep, lead 130
+    c = applyHeaderChain(c, HeaderChain(heavier.map(_.header)))
+    c.bestFullBlockOpt.get.header shouldBe own.last.header
+
+    val toDownload = c.nextModifiersToDownload(1000, (_, id) => !c.contains(id)).values.flatten.toSet
+    val forkBase = heavier.head.blockSections.map(_.id).toSet // the heavier chain's block at height 101
+    val requestedHeights = heavier.filter(_.blockSections.exists(s => toDownload.contains(s.id))).map(_.header.height)
+    withClue(s"requested heavier-chain heights ${requestedHeights.headOption}..${requestedHeights.lastOption}: ") {
+      (forkBase & toDownload).nonEmpty shouldBe true
+    }
+  }
 }
