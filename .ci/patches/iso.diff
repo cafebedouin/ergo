@@ -1,0 +1,502 @@
+diff --git a/src/it/scala/org/ergoplatform/it/DeepRollBackIsolationSpec.scala b/src/it/scala/org/ergoplatform/it/DeepRollBackIsolationSpec.scala
+new file mode 100644
+index 000000000..f7432730e
+--- /dev/null
++++ b/src/it/scala/org/ergoplatform/it/DeepRollBackIsolationSpec.scala
+@@ -0,0 +1,58 @@
++package org.ergoplatform.it
++
++import akka.actor.{ActorRef, ActorSystem}
++import akka.io.Tcp
++import akka.testkit.{ExplicitlyTriggeredScheduler, TestActorRef, TestProbe}
++import com.typesafe.config.ConfigFactory
++import org.ergoplatform.network.message.MessageConstants.MessageCode
++import org.ergoplatform.network.peer.PeerManager.ReceivableMessages.RandomPeerExcluding
++import org.ergoplatform.settings.ScorexSettings
++import org.ergoplatform.utils.ErgoNodeTestConstants.settings
++import org.scalatest.flatspec.AnyFlatSpec
++import org.scalatest.matchers.should.Matchers
++import scorex.core.app.ScorexContext
++import scorex.core.network.NetworkController
++
++import java.net.InetSocketAddress
++import scala.concurrent.{Await, ExecutionContext}
++import scala.concurrent.duration._
++
++class DeepRollBackIsolationSpec extends AnyFlatSpec with Matchers {
++  "Isolated rollback mining" should "disable automatic peer selection and reject incoming connections" in {
++    val ordinaryConfig = ConfigFactory.load()
++    val isolatedNetwork = ScorexSettings.fromConfig(
++      DeepRollBackSpec.isolatedMiningConfig.withFallback(ordinaryConfig).resolve()).network
++    ScorexSettings.fromConfig(ordinaryConfig).network.maxConnections should be > 0
++
++    implicit val system: ActorSystem = ActorSystem("RollbackIsolation", ConfigFactory.parseString(
++      "akka.scheduler.implementation = akka.testkit.ExplicitlyTriggeredScheduler"))
++    implicit val ec: ExecutionContext = system.dispatcher
++    try {
++      def controller(maxConnections: Int): (TestActorRef[NetworkController], TestProbe) = {
++        val peers = TestProbe()
++        val tcp = TestProbe()
++        val controllerSettings = settings.copy(scorexSettings = settings.scorexSettings.copy(
++          network = settings.scorexSettings.network.copy(maxConnections = maxConnections)))
++        val ref = TestActorRef(new NetworkController(controllerSettings, peers.ref,
++          ScorexContext(Seq.empty, None, None), tcp.ref, _ => Map.empty[MessageCode, ActorRef]))
++        tcp.expectMsgType[Tcp.Bind]
++        ref ! Tcp.Bound(controllerSettings.scorexSettings.network.bindAddress)
++        (ref, peers)
++      }
++
++      val (isolated, isolatedPeers) = controller(isolatedNetwork.maxConnections)
++      val (_, ordinaryPeers) = controller(maxConnections = 1)
++      system.scheduler.asInstanceOf[ExplicitlyTriggeredScheduler].timePasses(5.seconds)
++      ordinaryPeers.expectMsgType[RandomPeerExcluding](3.seconds)
++      isolatedPeers.expectNoMessage(200.millis)
++
++      val incoming = TestProbe()
++      incoming.send(isolated, Tcp.Connected(new InetSocketAddress("127.0.0.2", 9000),
++        settings.scorexSettings.network.bindAddress))
++      incoming.expectMsg(Tcp.Close)
++      isolatedPeers.expectNoMessage(200.millis)
++    } finally {
++      Await.result(system.terminate(), 10.seconds)
++    }
++  }
++}
+diff --git a/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala b/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala
+index 987203f53..01d8bea4d 100644
+--- a/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala
++++ b/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala
+@@ -2,7 +2,7 @@ package org.ergoplatform.it
+ 
+ import java.io.File
+ import java.util.concurrent.TimeoutException
+-import com.typesafe.config.Config
++import com.typesafe.config.{Config, ConfigFactory}
+ import io.circe.Json
+ import org.ergoplatform.it.api.NodeApi.{NodeInfo, nodeInfoDecoder}
+ import org.ergoplatform.it.container.{IntegrationSuite, Node}
+@@ -152,19 +152,22 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
+       docker.stopNode(minerAGen.containerId)
+       docker.stopNode(minerBGen.containerId)
+ 
+-      val minerAIsolated: Node = docker.startDevNetNode(minerAConfig, isolatedPeersConfig,
++      val minerAIsolated: Node = docker.startDevNetNode(DeepRollBackSpec.isolatedMiningConfig.withFallback(minerAConfig), isolatedPeersConfig,
+         specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
+ 
+       // 1. Let nodeA mine `chainLength + delta` blocks in isolation
+       Async.await(minerAIsolated.waitForHeight(chainLength + delta))
+ 
+-      val minerBIsolated: Node = docker.startDevNetNode(minerBConfig, isolatedPeersConfig,
++      val minerBIsolated: Node = docker.startDevNetNode(DeepRollBackSpec.isolatedMiningConfig.withFallback(minerBConfig), isolatedPeersConfig,
+         specialVolumeOpt = Some((localVolumeB, remoteVolumeB))).get
+       Async.await(observeNodes("isolated miners started", minerAIsolated, minerBIsolated))
+ 
+       // 2. Let nodeB mine `chainLength` blocks in isolation
+       Async.await(minerBIsolated.waitForHeight(chainLength, 100.millis))
+ 
++      Async.await(minerAIsolated.connectedPeers) shouldBe empty
++      Async.await(minerBIsolated.connectedPeers) shouldBe empty
++
+       log.info("Mining phase done")
+ 
+       val minerABestHeight = Async.await(minerAIsolated.fullHeight)
+@@ -216,3 +219,9 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
+   }
+ 
+ }
++
++object DeepRollBackSpec {
++  // The retained peer database survives restarts. Disable automatic outgoing connections
++  // and incoming admission during mining; final restarts use the ordinary node configs.
++  private[it] val isolatedMiningConfig: Config = ConfigFactory.parseString("scorex.network.maxConnections = 0")
++}
+diff --git a/src/it/scala/org/ergoplatform/it/UtxoStateNodesSyncSpec.scala b/src/it/scala/org/ergoplatform/it/UtxoStateNodesSyncSpec.scala
+index 2d8190359..662abf338 100644
+--- a/src/it/scala/org/ergoplatform/it/UtxoStateNodesSyncSpec.scala
++++ b/src/it/scala/org/ergoplatform/it/UtxoStateNodesSyncSpec.scala
+@@ -1,8 +1,9 @@
+ package org.ergoplatform.it
+ 
+ import com.typesafe.config.Config
++import io.circe.Json
+ import org.ergoplatform.it.container.{IntegrationSuite, Node}
+-import org.ergoplatform.it.util.ConvergenceObservations
++import org.ergoplatform.it.util.{ConvergenceObservations, UtxoSyncFailureDiagnostics}
+ import org.scalatest.flatspec.AnyFlatSpec
+ 
+ import scala.concurrent.duration._
+@@ -75,7 +76,12 @@ class UtxoStateNodesSyncSpec extends AnyFlatSpec with IntegrationSuite {
+     catch {
+       case error: java.util.concurrent.TimeoutException =>
+         log.error(s"UTXO synchronization timed out; recent observations: ${recent.mkString("; ")}")
+-        throw error
++        UtxoSyncFailureDiagnostics.rethrowAfterCapture(error, nodes.map { node => () =>
++          node.singleGet("/info", _.setRequestTimeout(2000)).map { response =>
++            require(response.getStatusCode == 200, "Unexpected diagnostic status")
++            node.ergoJsonAnswerAs[Json](response.getResponseBody)
++          }
++        })(snapshot => log.error(s"UTXO post-failure diagnostics: $snapshot"))
+     } finally observations.close()
+   }
+ 
+diff --git a/src/it/scala/org/ergoplatform/it/util/UtxoSyncFailureDiagnostics.scala b/src/it/scala/org/ergoplatform/it/util/UtxoSyncFailureDiagnostics.scala
+new file mode 100644
+index 000000000..b4ec6707c
+--- /dev/null
++++ b/src/it/scala/org/ergoplatform/it/util/UtxoSyncFailureDiagnostics.scala
+@@ -0,0 +1,60 @@
++package org.ergoplatform.it.util
++
++import io.circe.Json
++
++import java.util.concurrent.TimeoutException
++import scala.concurrent.{Await, ExecutionContext, Future}
++import scala.concurrent.duration._
++
++/** Additional observations after failure, with their own bound and no effect on the assertion. */
++object UtxoSyncFailureDiagnostics {
++  private val requestBudget = 2.seconds
++  private val collectionBudget = 2500.millis
++  private val numericFields = Seq("headersHeight", "fullHeight", "headersScore", "fullBlocksScore", "peersCount")
++  private val headerFields = Seq("bestHeaderId", "bestFullHeaderId", "genesisBlockId")
++
++  def project(node: Int, sampledAt: Long, response: Either[String, Json]): Json = {
++    val identity = Seq("node" -> Json.fromInt(node), "sampledAt" -> Json.fromLong(sampledAt))
++    def failed(errorClass: String): Json = {
++      val safeClass = if (errorClass.matches("[A-Za-z_$][A-Za-z0-9_$]{0,127}")) errorClass else "ObservationFailure"
++      Json.obj((identity :+ ("errorClass" -> Json.fromString(safeClass))): _*)
++    }
++    response match {
++      case Left(errorClass) => failed(errorClass)
++      case Right(body) if !body.isObject => failed("InvalidInfoResponse")
++      case Right(body) =>
++        def field(name: String)(decode: Json => Option[Json]): (String, Json) = {
++          val value = body.hcursor.downField(name).focus match {
++            case None => Json.Null
++            case Some(value) if value.isNull => Json.Null
++            case Some(value) => decode(value).getOrElse(Json.fromString("invalid"))
++          }
++          name -> value
++        }
++        val numbers = numericFields.map(name => field(name) { value =>
++          value.asNumber.flatMap(_.toBigInt).filter(_ >= 0).map(Json.fromBigInt)
++        })
++        val headers = headerFields.map(name => field(name) { value =>
++          value.asString.map(id => Json.fromString(ConvergenceObservations.headerId(id)))
++        })
++        val mining = field("isMining")(_.asBoolean.map(Json.fromBoolean))
++        Json.obj((identity ++ numbers ++ headers :+ mining): _*)
++    }
++  }
++
++  def rethrowAfterCapture(original: TimeoutException, requests: Seq[() => Future[Json]])
++                         (emit: String => Unit)(implicit ec: ExecutionContext): Unit = {
++    try {
++      val observations = new ConvergenceObservations
++      try {
++        val snapshots = requests.zipWithIndex.map { case (request, index) =>
++          observations.probe(Future(request()).flatMap(response => response))
++            .sample(requestBudget).map(response => project(index, System.currentTimeMillis(), response))
++        }
++        // This bound starts only after the synchronization assertion has already failed.
++        val result = Await.result(Future.sequence(snapshots), collectionBudget)
++        emit(Json.arr(result: _*).noSpaces)
++      } finally observations.close()
++    } finally throw original
++  }
++}
+diff --git a/src/it/scala/org/ergoplatform/it/util/UtxoSyncFailureDiagnosticsSpec.scala b/src/it/scala/org/ergoplatform/it/util/UtxoSyncFailureDiagnosticsSpec.scala
+new file mode 100644
+index 000000000..152b8c578
+--- /dev/null
++++ b/src/it/scala/org/ergoplatform/it/util/UtxoSyncFailureDiagnosticsSpec.scala
+@@ -0,0 +1,111 @@
++package org.ergoplatform.it.util
++
++import io.circe.Json
++import io.circe.parser.parse
++import org.scalatest.flatspec.AnyFlatSpec
++import org.scalatest.matchers.should.Matchers
++
++import java.io.IOException
++import java.util.concurrent.TimeoutException
++import java.util.concurrent.atomic.AtomicInteger
++import scala.concurrent.{Await, ExecutionContext, Future, Promise}
++import scala.concurrent.duration._
++
++class UtxoSyncFailureDiagnosticsSpec extends AnyFlatSpec with Matchers {
++  private implicit val ec: ExecutionContext = ExecutionContext.global
++  private val marker = "untrusted-extra-value"
++  private val header = "ab" * 32
++
++  "Failure diagnostics" should "preserve only typed diagnostic fields and exact cumulative scores" in {
++    val score = BigInt("123456789012345678901234567890")
++    val body = Json.obj(
++      "headersHeight" -> Json.fromInt(13), "fullHeight" -> Json.fromInt(9),
++      "headersScore" -> Json.fromBigInt(score), "fullBlocksScore" -> Json.fromBigInt(score - 4),
++      "bestHeaderId" -> Json.fromString(header), "bestFullHeaderId" -> Json.fromString(header),
++      "genesisBlockId" -> Json.fromString(header), "isMining" -> Json.True,
++      "peersCount" -> Json.fromInt(3), "name" -> Json.fromString(marker),
++      "address" -> Json.fromString(marker), "sampledAt" -> Json.fromString(marker))
++    val result = UtxoSyncFailureDiagnostics.project(2, 123L, Right(body))
++    result.hcursor.get[BigInt]("headersScore") shouldBe Right(score)
++    result.hcursor.get[BigInt]("fullBlocksScore") shouldBe Right(score - 4)
++    result.hcursor.get[String]("bestHeaderId") shouldBe Right(header)
++    result.hcursor.get[Int]("headersHeight") shouldBe Right(13)
++    result.hcursor.get[Int]("fullHeight") shouldBe Right(9)
++    result.hcursor.get[Boolean]("isMining") shouldBe Right(true)
++    result.hcursor.get[Int]("peersCount") shouldBe Right(3)
++    result.hcursor.get[Int]("node") shouldBe Right(2)
++    result.hcursor.get[Long]("sampledAt") shouldBe Right(123L)
++    result.asObject.get.keys.toSet shouldBe Set("node", "sampledAt", "headersHeight", "fullHeight",
++      "headersScore", "fullBlocksScore", "bestHeaderId", "bestFullHeaderId", "genesisBlockId", "isMining", "peersCount")
++    result.noSpaces should not include marker
++  }
++
++  it should "mark malformed fields and preserve missing fields without copying their contents" in {
++    val body = Json.obj("headersHeight" -> Json.fromString(marker), "fullHeight" -> Json.fromInt(-1),
++      "headersScore" -> Json.arr(Json.fromString(marker)), "isMining" -> Json.fromString(marker),
++      "bestHeaderId" -> Json.fromString(marker), "genesisBlockId" -> Json.obj("secret" -> Json.fromString(marker)))
++    val result = UtxoSyncFailureDiagnostics.project(0, 1L, Right(body))
++    Seq("headersHeight", "fullHeight", "headersScore", "isMining", "genesisBlockId").foreach { key =>
++      result.hcursor.get[String](key) shouldBe Right("invalid")
++    }
++    result.hcursor.get[String]("bestHeaderId") shouldBe Right("invalid-header-id")
++    Seq("fullBlocksScore", "peersCount", "bestFullHeaderId").foreach { key =>
++      result.hcursor.downField(key).focus shouldBe Some(Json.Null)
++    }
++    result.noSpaces should not include marker
++    UtxoSyncFailureDiagnostics.project(0, 1L, Right(Json.fromString(marker)))
++      .hcursor.get[String]("errorClass") shouldBe Right("InvalidInfoResponse")
++    UtxoSyncFailureDiagnostics.project(0, 1L, Left("bad/class: " + marker)).noSpaces should not include marker
++  }
++
++  it should "retain the original timeout when transport or request creation fails" in {
++    val original = new TimeoutException("original assertion")
++    var captured = ""
++    val requests = Seq[() => Future[Json]](
++      () => Future.successful(Json.obj("name" -> Json.fromString(marker))),
++      () => Future.failed(new IOException(marker)),
++      () => throw new IllegalStateException(marker),
++      () => Future.successful(Json.fromString(marker)))
++    val thrown = intercept[TimeoutException] {
++      UtxoSyncFailureDiagnostics.rethrowAfterCapture(original, requests)(value => captured = value)
++    }
++    (thrown eq original) shouldBe true
++    val snapshots = parse(captured).toOption.get.asArray.get
++    snapshots.size shouldBe 4
++    snapshots.map(_.hcursor.get[Int]("node").toOption.get) shouldBe Vector(0, 1, 2, 3)
++    snapshots(1).hcursor.get[String]("errorClass") shouldBe Right("IOException")
++    snapshots(2).hcursor.get[String]("errorClass") shouldBe Right("IllegalStateException")
++    snapshots(3).hcursor.get[String]("errorClass") shouldBe Right("InvalidInfoResponse")
++    captured should not include marker
++  }
++
++  it should "retain the original timeout if emitting diagnostics fails" in {
++    val original = new TimeoutException("original assertion")
++    val thrown = intercept[TimeoutException] {
++      UtxoSyncFailureDiagnostics.rethrowAfterCapture(original, Seq(() => Future.successful(Json.obj()))) { _ =>
++        throw new IllegalArgumentException(marker)
++      }
++    }
++    (thrown eq original) shouldBe true
++  }
++
++  it should "start all pending requests and finish collection under its separate bound" in {
++    val original = new TimeoutException("original assertion")
++    val started = new AtomicInteger(0)
++    val pending = Seq.fill(4)(Promise[Json]())
++    var captured = ""
++    val thrown = intercept[TimeoutException] {
++      Await.result(Future {
++        UtxoSyncFailureDiagnostics.rethrowAfterCapture(original, pending.map { promise => () =>
++          started.incrementAndGet()
++          promise.future
++        })(value => captured = value)
++      }, 4.seconds)
++    }
++    (thrown eq original) shouldBe true
++    started.get() shouldBe 4
++    parse(captured).toOption.get.asArray.get.foreach { snapshot =>
++      snapshot.hcursor.get[String]("errorClass") shouldBe Right("TimeoutException")
++    }
++  }
++}
+diff --git a/src/test/scala/org/ergoplatform/network/ErgoNodeViewSynchronizerSpecification.scala b/src/test/scala/org/ergoplatform/network/ErgoNodeViewSynchronizerSpecification.scala
+index a8998129e..46b2abf94 100644
+--- a/src/test/scala/org/ergoplatform/network/ErgoNodeViewSynchronizerSpecification.scala
++++ b/src/test/scala/org/ergoplatform/network/ErgoNodeViewSynchronizerSpecification.scala
+@@ -7,8 +7,9 @@ import org.ergoplatform.modifiers.history.extension.Extension
+ import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock, ManifestTypeId, UtxoSnapshotChunkTypeId}
+ import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages._
+ import org.ergoplatform.nodeView.ErgoNodeViewHolder
++import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetNodeViewChanges
+ import org.ergoplatform.nodeView.history.{ErgoHistory, ErgoHistoryReader, ErgoSyncInfoMessageSpec, ErgoSyncInfoV2}
+-import org.ergoplatform.nodeView.mempool.ErgoMemPool
++import org.ergoplatform.nodeView.mempool.{ErgoMemPool, ErgoMemPoolReader}
+ import org.ergoplatform.nodeView.state.wrapped.WrappedUtxoState
+ import org.ergoplatform.nodeView.state.{StateType, UtxoState}
+ import org.ergoplatform.sanity.ErgoSanity._
+@@ -69,7 +70,27 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
+     }
+   }
+ 
+-  class NodeViewHolderMock extends ErgoNodeViewHolder[UtxoState](settings)
++  private def isolatedNodeSettings(prototype: ErgoSettings): ErgoSettings = {
++    val directory = createTempDir
++    prototype.copy(directory = directory.getAbsolutePath,
++      walletSettings = prototype.walletSettings.copy(secretStorage =
++        prototype.walletSettings.secretStorage.copy(
++          secretDir = new java.io.File(directory, "keystore").getAbsolutePath)))
++  }
++
++  class NodeViewHolderMock(nodeSettings: ErgoSettings) extends ErgoNodeViewHolder[UtxoState](nodeSettings)
++
++  class InjectedReadersNodeViewHolder(nodeSettings: ErgoSettings,
++                                     injectedHistory: ErgoHistoryReader,
++                                     injectedMempool: ErgoMemPoolReader) extends NodeViewHolderMock(nodeSettings) {
++    // This fixture owns its history and mempool; startup replies must use those same readers.
++    override protected def getNodeViewChanges: Receive = {
++      case request: GetNodeViewChanges =>
++        if (request.history) sender() ! ChangedHistory(injectedHistory)
++        super.getNodeViewChanges(request.copy(history = false, mempool = false))
++        if (request.mempool) sender() ! ChangedMempool(injectedMempool)
++    }
++  }
+ 
+   class SynchronizerMock(networkControllerRef: ActorRef,
+                          viewHolderRef: ActorRef,
+@@ -131,7 +152,7 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
+     val h = localHistoryGen.sample.get
+     @SuppressWarnings(Array("org.wartremover.warts.OptionPartial"))
+     val s = localStateGen.sample.get
+-    val settings = ErgoSettingsReader.read()
++    val settings = isolatedNodeSettings(ErgoSettingsReader.read())
+     val pool = ErgoMemPool.empty(settings)
+     implicit val ec: ExecutionContextExecutor = system.dispatcher
+     val ncProbe = TestProbe("NetworkControllerProbe")
+@@ -140,9 +161,7 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
+     val syncTracker = ErgoSyncTracker(settings.scorexSettings.network)
+     val deliveryTracker: DeliveryTracker = DeliveryTracker.empty(settings)
+ 
+-    // each test should always start with empty history
+-    deleteRecursive(ErgoHistory.historyDir(settings))
+-    val nodeViewHolderMockRef = system.actorOf(Props(new NodeViewHolderMock))
++    val nodeViewHolderMockRef = system.actorOf(Props(new InjectedReadersNodeViewHolder(settings, h, pool)))
+ 
+     val synchronizerMockRef = system.actorOf(Props(
+       new SynchronizerMock(
+@@ -176,15 +195,14 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
+   }
+ 
+   class Synchronizer2Fixture extends AkkaFixture {
++    val settings: ErgoSettings = isolatedNodeSettings(org.ergoplatform.utils.ErgoNodeTestConstants.settings)
+     implicit val ec: ExecutionContextExecutor = system.dispatcher
+     val ncProbe = TestProbe("NetworkControllerProbe")
+     val pchProbe = TestProbe("PeerHandlerProbe")
+     val syncTracker = ErgoSyncTracker(settings.scorexSettings.network)
+     val deliveryTracker: DeliveryTracker = DeliveryTracker.empty(settings)
+ 
+-    // each test should always start with empty history
+-    deleteRecursive(ErgoHistory.historyDir(settings))
+-    val nodeViewHolderMockRef = system.actorOf(Props(new NodeViewHolderMock))
++    val nodeViewHolderMockRef = system.actorOf(Props(new NodeViewHolderMock(settings)))
+ 
+     val synchronizerMockRef = system.actorOf(Props(
+       new SynchronizerMock(
+@@ -223,7 +241,7 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
+     )
+ 
+     deleteRecursive(ErgoHistory.historyDir(synchronizerSettings))
+-    val nodeViewHolderMockRef = system.actorOf(Props(new NodeViewHolderMock))
++    val nodeViewHolderMockRef = system.actorOf(Props(new NodeViewHolderMock(synchronizerSettings)))
+ 
+     val synchronizerMockRef = system.actorOf(Props(
+       new SynchronizerMock(
+@@ -583,6 +601,16 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
+     withFixture { ctx =>
+       import ctx._
+ 
++      // Replay a late startup request before observing the peer response. The fixture's
++      // injected history and mempool must not be replaced by the holder's empty readers.
++      val startupReaders = TestProbe("StartupReaders")
++      startupReaders.send(nodeViewHolder,
++        GetNodeViewChanges(history = true, state = false, vault = false, mempool = true))
++      val changedHistory = startupReaders.expectMsgType[ChangedHistory](3.seconds)
++      val changedMempool = startupReaders.expectMsgType[ChangedMempool](3.seconds)
++      synchronizer ! changedHistory
++      synchronizer ! changedMempool
++
+       val sync = ErgoSyncInfoV2(Seq(altchain.last))
+ 
+       // Neighbour is sending
+diff --git a/src/test/scala/org/ergoplatform/utils/generators/ErgoNodeTransactionGenerators.scala b/src/test/scala/org/ergoplatform/utils/generators/ErgoNodeTransactionGenerators.scala
+index 5766cc1ad..855a848f0 100644
+--- a/src/test/scala/org/ergoplatform/utils/generators/ErgoNodeTransactionGenerators.scala
++++ b/src/test/scala/org/ergoplatform/utils/generators/ErgoNodeTransactionGenerators.scala
+@@ -57,7 +57,13 @@ object ErgoNodeTransactionGenerators extends ScorexLogging {
+ 
+   def ergoBoxGenForTokens(tokens: Seq[(TokenId, Long)],
+                           propositionGen: Gen[ErgoTree]): Gen[ErgoBox] = {
+-    ergoBoxGen(propGen = propositionGen, tokensGen = Gen.oneOf(tokens, tokens), heightGen = EmptyHistoryHeight)
++    val minValue = BoxUtils.sufficientAmount(extendedParameters)
++    ergoBoxGen(
++      propGen = propositionGen,
++      tokensGen = Gen.oneOf(tokens, tokens),
++      valueGenOpt = Some(validValueGen.map(value => Math.max(value, minValue))),
++      heightGen = EmptyHistoryHeight
++    )
+   }
+ 
+   def unspendableErgoBoxGen(minValue: Long = parameters.minValuePerByte * 200,
+diff --git a/src/test/scala/org/ergoplatform/utils/generators/FundedBoxHolderGeneratorsSpec.scala b/src/test/scala/org/ergoplatform/utils/generators/FundedBoxHolderGeneratorsSpec.scala
+new file mode 100644
+index 000000000..cf50e1d88
+--- /dev/null
++++ b/src/test/scala/org/ergoplatform/utils/generators/FundedBoxHolderGeneratorsSpec.scala
+@@ -0,0 +1,45 @@
++package org.ergoplatform.utils.generators
++
++import org.ergoplatform.utils.BoxUtils
++import org.ergoplatform.utils.generators.ErgoCoreGenerators.trueLeafGen
++import org.ergoplatform.utils.ErgoNodeTestConstants.extendedParameters
++import org.ergoplatform.utils.generators.ErgoNodeTransactionGenerators._
++import org.scalacheck.Gen
++import org.scalacheck.rng.Seed
++import org.scalatest.flatspec.AnyFlatSpec
++import org.scalatest.matchers.should.Matchers
++import sigmastate.eval.Extensions._
++
++class FundedBoxHolderGeneratorsSpec extends AnyFlatSpec with Matchers {
++  "Generated box holders" should "fund small input groups and conserve their value" in {
++    val minimum = BoxUtils.sufficientAmount(extendedParameters)
++    // This seed includes a value below the transaction generator's conservative floor.
++    val holder = boxesHolderGenOfSize(5).pureApply(Gen.Parameters.default, Seed(803L))
++    holder.size shouldBe 5
++    val boxes = holder.boxes.values.toIndexedSeq
++    Seq(1, 2).foreach { inputCount =>
++      boxes.grouped(inputCount).foreach { inputs =>
++        val tx = validUnsignedTransactionFromBoxes(inputs, issueNew = false)
++        tx.inputs.map(_.boxId.toSeq) shouldBe inputs.map(_.id.toSeq)
++        tx.outputCandidates.map(_.value).sum shouldBe inputs.map(_.value).sum
++        tx.outputCandidates.foreach { output =>
++          output.value should be >= minimum
++          output.additionalTokens.length shouldBe 0
++        }
++      }
++    }
++    boxes.foreach(_.value should be >= minimum)
++  }
++
++  it should "preserve supplied tokens when the node generator funds a box" in {
++    val token = Array.fill[Byte](32)(1).toTokenId
++    val box = ergoBoxGenForTokens(Seq(token -> 7L), trueLeafGen)
++      .pureApply(Gen.Parameters.default, Seed(803L))
++    val tx = validUnsignedTransactionFromBoxes(IndexedSeq(box), issueNew = false)
++    val tokens = tx.outputCandidates.flatMap(_.additionalTokens.toArray)
++    box.value should be >= BoxUtils.sufficientAmount(extendedParameters)
++    tx.outputCandidates.map(_.value).sum shouldBe box.value
++    tokens.map(_._1.toArray.toSeq).distinct shouldBe Seq(token.toArray.toSeq)
++    tokens.map(_._2).sum shouldBe 7L
++  }
++}

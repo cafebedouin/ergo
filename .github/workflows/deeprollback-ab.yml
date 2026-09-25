@@ -1,0 +1,64 @@
+# DeepRollBackSpec A/B on v6.0.7: does it pass with the V2 genesis anchor and the download scan-back?
+# Variants (patches in .ci/patches, applied in order):
+#   base          v6.0.7 as is
+#   iso           + #2535's test support (isolates the miners with maxConnections = 0)
+#   iso-anchor    + the genesis anchor in full V2 sync summaries (ErgoHistoryReader.syncInfoV2)
+#   iso-scanback  + the scan-back in nextModifiersToDownload (ToDownloadProcessor)
+#   iso-both      + both
+# Every run uploads the test reports and every container's log.
+name: DeepRollBackSpec A/B
+on:
+  push:
+    branches: [ 'ci/deeprollback' ]
+jobs:
+  it:
+    name: ${{ matrix.variant }} run ${{ matrix.rep }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [ base, iso, iso-anchor, iso-scanback, iso-both ]
+        rep: [ 1, 2, 3, 4 ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+      - uses: sbt/setup-sbt@v1
+      - name: Apply the variant's patches
+        run: |
+          case "${{ matrix.variant }}" in
+            base) patches="" ;;
+            iso) patches="iso" ;;
+            iso-anchor) patches="iso anchor" ;;
+            iso-scanback) patches="iso scanback" ;;
+            iso-both) patches="iso anchor scanback" ;;
+          esac
+          for p in $patches; do git apply ".ci/patches/$p.diff"; echo "applied $p"; done
+          git diff --stat
+      - name: Build the integration image
+        run: sbt -Denv=test docker
+      - name: DeepRollBackSpec
+        run: |
+          mkdir -p tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test "it:testOnly org.ergoplatform.it.DeepRollBackSpec"
+      - name: Collect container logs
+        if: always()
+        run: |
+          mkdir -p ci-logs
+          for c in $(docker ps -aq); do docker logs "$c" > "ci-logs/$(docker inspect -f '{{.Name}}' "$c" | tr -d '/').log" 2>&1; done
+          ls -la ci-logs | head -20
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deeprollback-${{ matrix.variant }}-${{ matrix.rep }}
+          path: |
+            ci-logs/
+            target/test-reports/
+            target/it-reports/
+          if-no-files-found: warn
+          retention-days: 30
