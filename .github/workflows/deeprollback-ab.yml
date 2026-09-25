@@ -20,8 +20,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [ iso-clamp, iso-clamp-both ]
-        rep: [ 1, 2, 3, 4 ]
+        variant: [ iso-clamp-both ]
+        rep: [ 5, 6, 7, 8 ]
     steps:
       - uses: actions/checkout@v4
         with:
