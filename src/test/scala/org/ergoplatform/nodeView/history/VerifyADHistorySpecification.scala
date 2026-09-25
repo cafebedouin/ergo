@@ -83,8 +83,8 @@ class VerifyADHistorySpecification extends ErgoCorePropertyTest with NoShrink {
 
     history = applyBlock(history, b3)
 
-    history.bestHeaderOpt.get shouldBe a3.header
-    history.bestFullBlockOpt.get.header shouldBe ancestor.header
+    history.bestHeaderOpt.get shouldBe b3.header
+    history.bestFullBlockOpt.get.header shouldBe b3.header
     history.isInBestChain(history.bestFullBlockOpt.get.header) shouldBe true
   }
 

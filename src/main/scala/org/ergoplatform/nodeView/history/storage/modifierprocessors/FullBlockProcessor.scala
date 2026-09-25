@@ -84,10 +84,18 @@ trait FullBlockProcessor extends HeadersProcessor {
     case ToProcess(fullBlock, newModRow, Some(newBestBlockHeader), _)
       if bestFullBlockOpt.nonEmpty &&
         isBetterChain(newBestBlockHeader.id) &&
-        isInBestChain(newBestBlockHeader.id) &&
+        (isInBestChain(newBestBlockHeader.id) ||
+          isTieWithBodilessBestHeader(newBestBlockHeader) ||
+          (isBodilessOnBestHeaderChain(newBestBlockHeader.height) && newBestBlockHeader.height <= headersHeight)) &&
         isLinkable(fullBlock.header) =>
 
       val prevBest = bestFullBlockOpt.get
+      // on a tie won by this block's chain, the best header moves to it in the same storage batch
+      val bestHeaderRows = if (!isTieWithBodilessBestHeader(newBestBlockHeader)) Seq.empty else {
+        log.info(s"Best header moves to ${newBestBlockHeader.encodedId} at height ${newBestBlockHeader.height}: " +
+          s"same score as the best header, whose block is not here")
+        bestHeaderChainRows(newBestBlockHeader)
+      }
 
       //find chains starting from the forking point
       val (prevChain, newChain) = commonBlockThenSuffixes(prevBest.header, newBestBlockHeader)
@@ -102,7 +110,8 @@ trait FullBlockProcessor extends HeadersProcessor {
 
       // insert updated chains statuses
       val additionalIndexes = toApply.map(b => chainStatusKey(b.id) -> FullBlockProcessor.BestChainMarker) ++
-        toRemove.map(b => chainStatusKey(b.id) -> FullBlockProcessor.NonBestChainMarker)
+        toRemove.map(b => chainStatusKey(b.id) -> FullBlockProcessor.NonBestChainMarker) ++
+        bestHeaderRows
       updateStorage(newModRow, newBestBlockHeader.id, additionalIndexes).map { _ =>
         // remove block ids which have no chance to be applied
         val minForkRootHeight = toApply.last.height - nodeSettings.keepVersions
@@ -128,6 +137,36 @@ trait FullBlockProcessor extends HeadersProcessor {
       case (Some(prevBestScore), Some(score)) if score > prevBestScore => true
       case _ => false
     }
+  }
+
+  /**
+    * `true` if the chain ending at `header` has the same score as the best header chain, is not that chain, and
+    * the best header at this height has no full block here. The best header wins a tie by arriving first; a
+    * header whose block has not arrived should not keep the full chain (and a miner that mined on it) waiting.
+    */
+  private def isTieWithBodilessBestHeader(header: Header): Boolean =
+    !isInBestChain(header.id) &&
+      scoreOf(header.id).exists(score => bestHeaderIdOpt.flatMap(scoreOf).contains(score)) &&
+      isBodilessOnBestHeaderChain(header.height)
+
+  /**
+    * `true` if the best header chain's block at `height` cannot be applied here: its full block has not arrived, or it
+    * has but does not link to a full chain. Such a chain does not hold back a full chain that is better than the
+    * current best full block. The caller keeps the full chain at or below the header chain's height.
+    */
+  private def isBodilessOnBestHeaderChain(height: Int): Boolean =
+    bestHeaderAtHeight(height).forall(h => getFullBlock(h).isEmpty || !isLinkable(h))
+
+  /**
+    * Index rows making `header` the best header: it and its ancestors down to the best header chain go first in
+    * their height rows (each id once), and `BestHeaderKey` points at it.
+    */
+  private def bestHeaderChainRows(header: Header): Seq[(ByteArrayWrapper, Array[Byte])] = {
+    val forkHeaders = headerChainBack(header.height, header, (h: Header) => isInBestChain(h)).headers
+      .filter(h => !isInBestChain(h))
+    forkHeaders.map { h =>
+      heightIdsKey(h.height) -> (h.id +: headerIdsAtHeight(h.height).filter(_ != h.id)).flatMap(idToBytes).toArray
+    } :+ (BestHeaderKey -> idToBytes(header.id))
   }
 
   private def nonBestBlock: BlockProcessing = {
