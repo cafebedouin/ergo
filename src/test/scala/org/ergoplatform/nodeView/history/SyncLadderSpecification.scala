@@ -2,6 +2,7 @@ package org.ergoplatform.nodeView.history
 
 import org.ergoplatform.consensus.Younger
 import org.ergoplatform.modifiers.history.HeaderChain
+import org.ergoplatform.nodeView.history.ErgoHistoryReader.FullV2SyncOffsets
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils._
 import org.ergoplatform.nodeView.state.StateType
 import org.ergoplatform.utils.{ErgoCorePropertyTest, NoShrink}
@@ -57,6 +58,34 @@ class SyncLadderSpecification extends ErgoCorePropertyTest with NoShrink {
     val toDownload = c.nextModifiersToDownload(1000, (_, id) => !c.contains(id)).values.flatten.toSet
     val forkBase = heavier.head.blockSections.map(_.id).toSet // the heavier chain's block at height 2
     withClue(s"requested ${toDownload.size} section ids; fork base sections requested: ${(forkBase & toDownload).size}: ") {
+      (forkBase & toDownload).nonEmpty shouldBe true
+    }
+  }
+
+  property("a chain taller than the deepest offset sends only its offset samples in a full summary") {
+    var d = genHistory()
+    d = applyHeaderChain(d, genHeaderChain(600, d, diffBitsOpt = None, useRealTs = false))
+    val h = d.headersHeight
+    h should be > FullV2SyncOffsets.max
+    d.syncInfoV2(full = true).lastHeaders.map(_.height) shouldBe FullV2SyncOffsets.toSeq.map(h - _)
+  }
+
+  property("a node close behind a heavier chain that forked more than 100 blocks below it downloads the fork's blocks") {
+    var c = genHistory()
+    val common = genChain(100, c) // heights 1..100
+    c = applyChain(c, common)
+    val own = genChain(151, common.last).tail // C's own full chain, heights 101..251
+    c = applyChain(c, own)
+    Thread.sleep(2)
+    val heavier = genChain(201, common.last).tail // heights 101..301, headers only: fork 151 deep, lead 50
+    c = applyHeaderChain(c, HeaderChain(heavier.map(_.header)))
+    c.bestHeaderOpt.get shouldBe heavier.last.header
+    c.bestFullBlockOpt.get.header shouldBe own.last.header
+
+    val toDownload = c.nextModifiersToDownload(1000, (_, id) => !c.contains(id)).values.flatten.toSet
+    val forkBase = heavier.head.blockSections.map(_.id).toSet // the heavier chain's block at height 101 (near-tip scheduling starts at 251 - 100)
+    val requestedHeights = heavier.filter(_.blockSections.exists(s => toDownload.contains(s.id))).map(_.header.height)
+    withClue(s"requested heavier-chain heights ${requestedHeights.headOption}..${requestedHeights.lastOption}: ") {
       (forkBase & toDownload).nonEmpty shouldBe true
     }
   }
