@@ -88,6 +88,45 @@ class VerifyADHistorySpecification extends ErgoCorePropertyTest with NoShrink {
     history.isInBestChain(history.bestFullBlockOpt.get.header) shouldBe true
   }
 
+  property("bestFullBlock advances past a heavier header chain whose blocks are not here") {
+    var (history, _) = genHistory()
+    val commonChain = genChain(2, history)
+    history = applyChain(history, commonChain)
+    val ancestor = commonChain.last
+
+    val as = genChain(2, ancestor).tail
+    Thread.sleep(2)
+    val b3 = genChain(1, ancestor).tail.head
+
+    history = applyHeaderChain(history, HeaderChain(as.map(_.header)))
+    history = applyBlock(history, b3)
+
+    history.bestHeaderOpt.get shouldBe as(1).header
+    history.bestFullBlockOpt.get.header shouldBe b3.header
+  }
+
+  property("an unlinkable block on the best-header chain does not hold back a tying full chain") {
+    var (history, _) = genHistory()
+    val commonChain = genChain(2, history)
+    history = applyChain(history, commonChain)
+    val ancestor = commonChain.last
+
+    val as = genChain(2, ancestor).tail
+    Thread.sleep(2)
+    val b3 = genChain(1, ancestor).tail.head
+    Thread.sleep(2)
+    val b4 = genChain(1, b3).tail.head
+
+    history = applyHeaderChain(history, HeaderChain(as.map(_.header)))
+    as(1).blockSections.foreach(s => history = applySection(history, s)) // a4's body arrives, a3's does not
+    history = applyBlock(history, b3)
+    history = applyBlock(history, b4)
+
+    history.bestHeaderOpt.get shouldBe b4.header
+    history.bestFullBlockOpt.get.header shouldBe b4.header
+    history.isInBestChain(history.bestFullBlockOpt.get.header) shouldBe true
+  }
+
   property("ErgoModifiersCache.findCandidateKey() should find headers in case of forks") {
     val modifiersCache = new ErgoModifiersCache(Int.MaxValue)
 
