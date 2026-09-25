@@ -1,0 +1,61 @@
+# UtxoStateNodesSyncSpec on v6.0.7, repeated with container logs (upstream CI reports timeouts without a cause).
+# Variants (patches in .ci/patches, applied in order):
+#   base      v6.0.7 as is
+#   iso       + #2535's test support (adds UtxoSyncFailureDiagnostics)
+#   iso-both  + the V2 genesis anchor and the download scan-back
+name: UtxoStateNodesSyncSpec runs
+on:
+  push:
+    branches: [ 'ci/utxosync' ]
+jobs:
+  it:
+    name: ${{ matrix.variant }} run ${{ matrix.rep }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [ base, iso, iso-both ]
+        rep: [ 1, 2, 3, 4, 5, 6 ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+      - uses: sbt/setup-sbt@v1
+      - name: Apply the variant's patches
+        run: |
+          case "${{ matrix.variant }}" in
+            base) patches="" ;;
+            iso) patches="iso" ;;
+            iso-anchor) patches="iso anchor" ;;
+            iso-scanback) patches="iso scanback" ;;
+            iso-both) patches="iso anchor scanback" ;;
+          esac
+          for p in $patches; do git apply ".ci/patches/$p.diff"; echo "applied $p"; done
+          git diff --stat
+      - name: Build the integration image
+        run: sbt -Denv=test docker
+      - name: UtxoStateNodesSyncSpec
+        run: |
+          mkdir -p tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test "it:testOnly org.ergoplatform.it.UtxoStateNodesSyncSpec"
+      - name: Collect container logs
+        if: always()
+        run: |
+          mkdir -p ci-logs
+          for c in $(docker ps -aq); do docker logs "$c" > "ci-logs/$(docker inspect -f '{{.Name}}' "$c" | tr -d '/').log" 2>&1; done
+          ls -la ci-logs | head -20
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: utxosync-${{ matrix.variant }}-${{ matrix.rep }}
+          path: |
+            ci-logs/
+            target/test-reports/
+            target/it-reports/
+          if-no-files-found: warn
+          retention-days: 30
