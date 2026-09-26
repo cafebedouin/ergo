@@ -1,0 +1,25 @@
+diff --git a/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala b/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala
+index 01d8bea4d..fcf104542 100644
+--- a/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala
++++ b/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala
+@@ -148,8 +148,18 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
+       genesisAGen shouldBe genesisBGen
+       Async.await(observeNodes("initial shared chain", minerAGen, minerBGen))
+ 
+-      // 2. Stop all nodes
+-      docker.stopNode(minerAGen.containerId)
++      // 2. Stop all nodes. B restarts without peers, and its miner starts only when its headers are within 6 of its
++      // full blocks (ErgoMiner.isBlockchainNearlySynced). So stop A at once while B is level, which ends B's inflow,
++      // and check B's lead before stopping it.
++      Async.await(minerBGen.waitFor[NodeInfo](_.info,
++        i => i.bestHeaderHeightOpt.isDefined && i.bestHeaderHeightOpt == i.bestBlockHeightOpt, 100.millis))
++      docker.stopNode(minerAGen.containerId, secondsToWait = 0)
++      Thread.sleep(1000)
++      val minerBAtStop = Async.await(minerBGen.info)
++      val minerBLead = minerBAtStop.bestHeaderHeightOpt.getOrElse(0) - minerBAtStop.bestBlockHeightOpt.getOrElse(0)
++      withClue(s"B's headers lead its full blocks by $minerBLead after A stopped; its miner would not start after the restart: ") {
++        minerBLead should be < 6
++      }
+       docker.stopNode(minerBGen.containerId)
+ 
+       val minerAIsolated: Node = docker.startDevNetNode(DeepRollBackSpec.isolatedMiningConfig.withFallback(minerAConfig), isolatedPeersConfig,
