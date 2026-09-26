@@ -7,6 +7,7 @@
 #   iso-both      + both
 #   iso-clamp     + the clamp max(GenesisHeight, h - offset) in V2 sync summaries (jozanek's alternative to the anchor)
 #   iso-clamp-both + the clamp and the scan-back
+#   iso-fix-clamp-both + a fixture fix: stop B first, once its headers and full blocks agree
 # Every run uploads the test reports, the sbt log, and every container's log (including those Docker.close() saves to target/logs).
 name: DeepRollBackSpec A/B
 on:
@@ -20,8 +21,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [ iso-clamp-both ]
-        rep: [ 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 ]
+        variant: [ iso-fix-clamp-both ]
+        rep: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 ]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,6 +42,7 @@ jobs:
             iso-both) patches="iso anchor scanback" ;;
             iso-clamp) patches="iso clamp" ;;
             iso-clamp-both) patches="iso clamp scanback" ;;
+            iso-fix-clamp-both) patches="iso isofix clamp scanback" ;;
           esac
           for p in $patches; do git apply ".ci/patches/$p.diff"; echo "applied $p"; done
           git diff --stat

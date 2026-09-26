@@ -1,0 +1,19 @@
+diff --git a/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala b/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala
+index 01d8bea4d..425f2936a 100644
+--- a/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala
++++ b/src/it/scala/org/ergoplatform/it/DeepRollBackSpec.scala
+@@ -148,9 +148,12 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
+       genesisAGen shouldBe genesisBGen
+       Async.await(observeNodes("initial shared chain", minerAGen, minerBGen))
+ 
+-      // 2. Stop all nodes
+-      docker.stopNode(minerAGen.containerId)
++      // 2. Stop all nodes. B restarts without peers, and its miner starts only when its headers are within 6 of its
++      // full blocks, so stop B first, while A still serves it, and only once it holds the bodies of its headers.
++      Async.await(minerBGen.waitFor[NodeInfo](_.info,
++        i => i.bestHeaderHeightOpt.isDefined && i.bestHeaderHeightOpt == i.bestBlockHeightOpt, 100.millis))
+       docker.stopNode(minerBGen.containerId)
++      docker.stopNode(minerAGen.containerId)
+ 
+       val minerAIsolated: Node = docker.startDevNetNode(DeepRollBackSpec.isolatedMiningConfig.withFallback(minerAConfig), isolatedPeersConfig,
+         specialVolumeOpt = Some((localVolumeA, remoteVolumeA))).get
