@@ -1,0 +1,83 @@
+# Witness tests for claims made on ergoplatform/ergo, run on GitHub-hosted runners: each job checks out the commit
+# the claim cites, applies the listed patches (from this branch's .ci/patches), runs one spec, and passes only when
+# the spec's outcome is the one the claim states (a test that must fail on the release fails there).
+name: witness tests
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'ci/witnesses' ]
+jobs:
+  witness:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "mempool #2576: test on v6.0.7 fails"
+            ref: 0e3591db8ad3e5e6c7f993b84bfab42cc4f9ed47
+            spec: org.ergoplatform.nodeView.viewholder.ChainSwitchMempoolSpec
+            patches: ""
+            expect: fail
+          - name: "mempool #2576: with the fix passes"
+            ref: 98259a1bb25ceb712e4e152a40867db11397ecab
+            spec: org.ergoplatform.nodeView.viewholder.ChainSwitchMempoolSpec
+            patches: ""
+            expect: pass
+          - name: "penalty #2491: test on v6.0.7 fails"
+            ref: d256fd5d8b2ceacf91bba4da74015854e44d4213
+            spec: org.ergoplatform.network.peer.PenaltyWindowSpecification
+            patches: ""
+            expect: fail
+          - name: "penalty #2491: with the PR's hunk passes"
+            ref: d256fd5d8b2ceacf91bba4da74015854e44d4213
+            spec: org.ergoplatform.network.peer.PenaltyWindowSpecification
+            patches: "pr2491-penalize"
+            expect: pass
+          - name: "sync ladder #2535/#2575: P1-P5 fail on v6.0.7"
+            ref: fbeb7d9e2298a985a85d6e04f03ac1fee54adaf8
+            spec: org.ergoplatform.nodeView.history.SyncLadderSpecification
+            patches: ""
+            expect: fail
+          - name: "sync ladder #2535/#2575: clamp + scan-back + near-tip pass"
+            ref: fbeb7d9e2298a985a85d6e04f03ac1fee54adaf8
+            spec: org.ergoplatform.nodeView.history.SyncLadderSpecification
+            patches: "clamp scan-back near-tip"
+            expect: pass
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          path: node
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+      - uses: sbt/setup-sbt@v1
+      - name: Apply patches
+        working-directory: node
+        run: |
+          echo "commit $(git rev-parse HEAD)"
+          for p in ${{ matrix.patches }}; do git apply "../ci/.ci/patches/$p.diff"; echo "applied $p"; done
+          git diff --stat -- src/main
+      - name: Run the spec, expect ${{ matrix.expect }}
+        working-directory: node
+        run: |
+          set +e
+          sbt "testOnly ${{ matrix.spec }}" 2>&1 | tee ../spec.log
+          rc=${PIPESTATUS[0]}
+          grep -E '^\[info\] - |Tests:' ../spec.log | sed 's/\x1b\[[0-9;]*m//g'
+          if [ "${{ matrix.expect }}" = pass ] && [ $rc -eq 0 ]; then echo "OUTCOME: passed, as the claim states"; exit 0; fi
+          if [ "${{ matrix.expect }}" = fail ] && [ $rc -ne 0 ] && grep -q "FAILED \*\*\*" ../spec.log; then echo "OUTCOME: a test failed, as the claim states"; exit 0; fi
+          echo "OUTCOME: rc=$rc, expected ${{ matrix.expect }}"; exit 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: witness-${{ strategy.job-index }}
+          path: spec.log
+          retention-days: 30

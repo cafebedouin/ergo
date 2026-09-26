@@ -1,0 +1,54 @@
+diff --git a/src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/ToDownloadProcessor.scala b/src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/ToDownloadProcessor.scala
+index 37c119f..e209d75 100644
+--- a/src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/ToDownloadProcessor.scala
++++ b/src/main/scala/org/ergoplatform/nodeView/history/storage/modifierprocessors/ToDownloadProcessor.scala
+@@ -79,21 +79,23 @@ trait ToDownloadProcessor
+       }
+     }
+ 
++    // The newest ancestor of a full-chain tip that is off the best headers-chain, within the retained versions.
++    def commonAncestorOf(fb: ErgoFullBlock): Option[Header] = if (isInBestChain(fb.id)) {
++      None
++    } else {
++      val parentSteps = Math.max(0L, nodeSettings.keepVersions.toLong)
++      val limit = Math.min(fb.height.toLong, parentSteps + 1L).toInt
++      headerChainBack(limit, fb.header, h => isInBestChain(h.id)).headOption
++        .filter(h => isInBestChain(h.id))
++    }
++
+     bestFullBlockOpt match {
+       case _ if !isHeadersChainSynced || !nodeSettings.verifyTransactions =>
+         // do not download full blocks if no headers-chain synced yet or SPV mode
+         Map.empty
+       case Some(fb) if farAwayFromBeingSynced(fb) =>
+         // A different best headers-chain may need block sections below the old full-chain tip.
+-        val commonAncestor = if (isInBestChain(fb.id)) {
+-          None
+-        } else {
+-          val parentSteps = Math.max(0L, nodeSettings.keepVersions.toLong)
+-          val limit = Math.min(fb.height.toLong, parentSteps + 1L).toInt
+-          headerChainBack(limit, fb.header, h => isInBestChain(h.id)).headOption
+-            .filter(h => isInBestChain(h.id))
+-        }
+-        val fromHeight = commonAncestor
++        val fromHeight = commonAncestorOf(fb)
+           .map(h => Math.max(minimalFullBlockHeight, h.height + 1))
+           .getOrElse(fb.height + 1)
+         // Extending the scan backward must preserve forward progress beyond the existing full-chain tip.
+@@ -102,7 +104,15 @@ trait ToDownloadProcessor
+       case Some(fb) =>
+         // when blockchain is about to be synced,
+         // download children blocks of last 100 full blocks applied to the best chain, to get block sections from forks
+-        val minHeight = Math.max(1, fb.header.height - 100)
++        val lookbackHeight = Math.max(1, fb.header.height - 100)
++        // a fork deeper than the lookback also needs its block sections below it
++        val minHeight = if (lookbackHeight > minimalFullBlockHeight) {
++          commonAncestorOf(fb)
++            .map(h => Math.max(minimalFullBlockHeight, h.height + 1))
++            .fold(lookbackHeight)(Math.min(lookbackHeight, _))
++        } else {
++          lookbackHeight
++        }
+         continuation(minHeight, Map.empty, maxHeight = Int.MaxValue)
+       case None if (nodeSettings.utxoSettings.utxoBootstrap && !isUtxoSnapshotApplied) =>
+         // if bootstrapping with UTXO set snapshot is chosen, and no snapshot applied yet, ask peers for snapshots
