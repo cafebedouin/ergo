@@ -1433,21 +1433,16 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       * since the block was already announced.
       */
     case NewBlockMined(header) =>
-      log.info(
-        s"Immediately announcing newly mined block ${header.encodedId} " +
-        s"at height ${header.height} to all peers"
-      )
+      // experiment: announce after apply (pre-82d7f87cd order); a request that arrives before the apply is not served
+      log.info(s"Newly mined block ${header.encodedId} at height ${header.height}: announcing after apply")
+
+    // Locally mined block applied - announce it now that the node can serve its sections
+    case LocalBlockApplied(header, _) =>
+      log.info(s"Announcing locally mined block ${header.encodedId} at height ${header.height} after apply")
       broadcastModifierInv(Header.modifierTypeId, header.id)
       header.sectionIds.foreach { case (mtId, id) =>
         broadcastModifierInv(mtId, id)
       }
-
-    // Locally mined block applied - skip broadcast (already done via NewBlockMined)
-    case LocalBlockApplied(header, _) =>
-      log.debug(
-        s"Local block applied at height ${header.height}, " +
-        s"header id: ${header.encodedId}, skipping broadcast"
-      )
       clearDeclined()
       clearInterblockCost()
       perPeerCost.clear()
