@@ -155,6 +155,31 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     */
   private var lastCheckForModifiersToDownload: Long = 0L
 
+  // TD-DIAG (experiment instrumentation, not for upstream): the body-download scheduler's inputs and output, and the
+  // first best-chain height without a full block, with its sections' delivery status, every 5 s
+  private var lastTdDiag: Long = 0L
+  private def tdDiag(hr: ErgoHistory, now: Long): Unit = if (now - lastTdDiag >= 5000) {
+    lastTdDiag = now
+    scala.util.Try {
+      val budget = deliveryTracker.modifiersToDownload
+      val peers = getPeersForDownloadingBlocks.map(_.size)
+      val probe = hr.nextModifiersToDownload(50, downloadRequired(hr)).map { case (t, ids) => s"$t:${ids.size}" }.mkString(",")
+      val fb = hr.bestFullBlockOpt
+      val fbInBest = fb.exists(b => hr.isInBestChain(b.id))
+      val firstMissing = (1 to hr.headersHeight).iterator
+        .flatMap(h => hr.bestHeaderAtHeight(h).map(h -> _))
+        .find { case (_, hd) => hr.getFullBlock(hd).isEmpty }
+      val missingStr = firstMissing.map { case (h, hd) =>
+        val secs = hd.sectionIdsWithNoProof.map { case (t, id) =>
+          s"$t:${deliveryTracker.status(id, t, Array(hr))}:${if (hr.contains(id)) "stored" else "absent"}"
+        }.mkString(" ")
+        s"h$h ${hd.encodedId.take(8)} [$secs]"
+      }.getOrElse("none")
+      log.info(s"TD-DIAG budget=$budget peers=$peers synced=${hr.isHeadersChainSynced} full=${hr.fullBlockHeight} " +
+        s"fbInBest=$fbInBest hdr=${hr.headersHeight} tip=${hr.estimatedTip()} probe=[$probe] firstMissing=$missingStr")
+    }.failed.foreach(e => log.info(s"TD-DIAG error $e"))
+  }
+
   /**
     * How many block sections stored in processing queue, imprecise number as updated only when
     * this actor is getting data from view holder actor
@@ -1410,6 +1435,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       val now = System.currentTimeMillis()
       if (now - lastCheckForModifiersToDownload >= 50) { // do not process command more often than every 50 ms
         lastCheckForModifiersToDownload = now
+        tdDiag(historyReader, now)
         requestDownload(
           maxModifiers = deliveryTracker.modifiersToDownload,
           minModifiersPerBucket,
