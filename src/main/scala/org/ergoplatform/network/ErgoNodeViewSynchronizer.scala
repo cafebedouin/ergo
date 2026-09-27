@@ -1505,12 +1505,18 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
           // For missing parent header, request the parent header from peers if not already known
           val parentId = phError.parentId
           if (deliveryTracker.status(parentId, Header.modifierTypeId, Seq(historyReader)) == ModifiersStatus.Unknown) {
+            // the peer that delivered the orphan has its parent; a random older peer may be on another fork
+            val sender = deliveryTracker.getSource(modId, modTypeId)
             val olderPeers = syncTracker.peersByStatus.getOrElse(Older, Seq.empty)
-            if (olderPeers.nonEmpty) {
-              val randomPeer = olderPeers(scala.util.Random.nextInt(olderPeers.size))
-              requestBlockSection(Header.modifierTypeId, Seq(parentId), randomPeer)
-            } else {
-              logger.warn(s"No older peer available to download missing parent header $parentId for modifier $modId")
+            val target = sender.orElse {
+              if (olderPeers.nonEmpty) Some(olderPeers(scala.util.Random.nextInt(olderPeers.size))) else None
+            }
+            target match {
+              case Some(peer) =>
+                log.info(s"Requesting missing parent header $parentId for $modId from ${if (sender.isDefined) "sender" else "older peer"} $peer")
+                requestBlockSection(Header.modifierTypeId, Seq(parentId), peer)
+              case None =>
+                logger.warn(s"No older peer available to download missing parent header $parentId for modifier $modId")
             }
           }
           deliveryTracker.setUnknown(modId, modTypeId)
