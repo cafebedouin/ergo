@@ -175,8 +175,16 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
         }.mkString(" ")
         s"h$h ${hd.encodedId.take(8)} [$secs]"
       }.getOrElse("none")
+      val fi = deliveryTracker.fullInfo
+      val reqStr = fi.requested.map { case (t, m) =>
+        val ages = m.values.map(ri => now - ri.requestTime)
+        val noCheck = m.values.count(_.cancellable.isCancelled)
+        s"$t:${m.size}(>20s:${ages.count(_ > 20000)},>60s:${ages.count(_ > 60000)},noCheck:$noCheck)"
+      }.mkString(" ")
+      val recStr = fi.received.map { case (t, m) => s"$t:${m.size}" }.mkString(" ")
       log.info(s"TD-DIAG budget=$budget peers=$peers synced=${hr.isHeadersChainSynced} full=${hr.fullBlockHeight} " +
-        s"fbInBest=$fbInBest hdr=${hr.headersHeight} tip=${hr.estimatedTip()} probe=[$probe] firstMissing=$missingStr")
+        s"fbInBest=$fbInBest hdr=${hr.headersHeight} tip=${hr.estimatedTip()} probe=[$probe] firstMissing=$missingStr " +
+        s"requested=[$reqStr] received=[$recStr] cache=$modifiersCacheSize")
     }.failed.foreach(e => log.info(s"TD-DIAG error $e"))
   }
 
