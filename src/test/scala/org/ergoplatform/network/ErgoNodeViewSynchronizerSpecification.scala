@@ -4,6 +4,7 @@ import akka.actor.{ActorRef, ActorSystem, Cancellable, Props}
 import akka.testkit.TestProbe
 import org.ergoplatform.modifiers.history.header.{Header, HeaderSerializer}
 import org.ergoplatform.modifiers.history.extension.Extension
+import org.ergoplatform.modifiers.history.BlockTransactions
 import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock, ManifestTypeId, UtxoSnapshotChunkTypeId}
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages._
 import org.ergoplatform.nodeView.ErgoNodeViewHolder
@@ -1066,7 +1067,7 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
       val newBlock = statefulyValidFullBlock(wus)
       Thread.sleep(2000) // let the synchronizer take the view holder's start-up events
 
-      synchronizerMockRef ! NewBlockMined(newBlock.header)
+      synchronizerMockRef ! NewBlockMined(newBlock.header, newBlock.blockSections) // as CandidateGenerator publishes it
       // collect everything sent in the window, then keep the announcements (other messages may interleave)
       val announced = ncProbe.receiveWhile(2.seconds) { case m => m }.collect {
         case stn: SendToNetwork if stn.message.spec.messageCode == InvSpec.messageCode =>
@@ -1085,6 +1086,33 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
           msg.data.get.asInstanceOf[ModifiersData]
       }.flatMap(md => md.modifiers.keys.map(md.typeId -> _))
       announced.foreach(a => served should contain(a))
+    }
+  }
+
+  property("NodeViewSynchronizer: a newly mined block reported invalid is no longer served") {
+    withFixture2 { ctx =>
+      import ctx._
+
+      var wus = WrappedUtxoState(boxesHolderGen.sample.get, createTempDir, parameters, settings)
+      (0 until 3).foreach { _ =>
+        val block = statefulyValidFullBlock(wus)
+        wus = wus.applyModifier(block, None)(_ => ()).get
+      }
+      val newBlock = statefulyValidFullBlock(wus)
+      Thread.sleep(2000) // let the synchronizer take the view holder's start-up events
+
+      synchronizerMockRef ! NewBlockMined(newBlock.header, newBlock.blockSections)
+      ncProbe.receiveWhile(2.seconds) { case m => m }
+      synchronizerMockRef ! SemanticallyFailedModification(
+        BlockTransactions.modifierTypeId, newBlock.blockTransactions.id, new Exception("invalid"))
+
+      synchronizerMockRef ! Message(RequestModifierSpec,
+        Left(RequestModifierSpec.toBytes(InvData(Header.modifierTypeId, Seq(newBlock.header.id)))), Some(peer))
+      val served = pchProbe.receiveWhile(3.seconds) { case m => m }.collect {
+        case msg: Message[_] if msg.spec.messageCode == ModifiersSpec.messageCode =>
+          msg.data.get.asInstanceOf[ModifiersData]
+      }.flatMap(_.modifiers.keys)
+      served should not contain newBlock.header.id
     }
   }
 
