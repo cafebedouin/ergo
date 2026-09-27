@@ -1066,7 +1066,7 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
       val newBlock = statefulyValidFullBlock(wus)
       Thread.sleep(2000) // let the synchronizer take the view holder's start-up events
 
-      synchronizerMockRef ! NewBlockMined(newBlock.header)
+      synchronizerMockRef ! NewBlockMined(newBlock.header, newBlock.blockSections) // as CandidateGenerator publishes it
       // collect everything sent in the window, then keep the announcements (other messages may interleave)
       val announced = ncProbe.receiveWhile(2.seconds) { case m => m }.collect {
         case stn: SendToNetwork if stn.message.spec.messageCode == InvSpec.messageCode =>

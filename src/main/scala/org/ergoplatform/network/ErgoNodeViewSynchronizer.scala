@@ -155,6 +155,14 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     */
   private var lastCheckForModifiersToDownload: Long = 0L
 
+  // Header and sections of the last few blocks this node mined, by id: a mined block is announced before the node
+  // view holder applies it, so a peer's request can arrive before history has it (see `NewBlockMined`)
+  private val MinedBlocksToServe = 4
+  private var minedToServe: Vector[Map[ModifierId, (NetworkObjectTypeId.Value, Array[Byte])]] = Vector.empty
+
+  private def minedModifier(id: ModifierId): Option[(NetworkObjectTypeId.Value, Array[Byte])] =
+    minedToServe.iterator.flatMap(_.get(id)).toSeq.headOption
+
   /**
     * How many block sections stored in processing queue, imprecise number as updated only when
     * this actor is getting data from view holder actor
@@ -1194,7 +1202,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
           }
         case expectedTypeId: NetworkObjectTypeId.Value =>
           invData.ids.flatMap { id =>
-            hr.modifierTypeAndBytesById(id).flatMap { case (mTypeId, bytes) =>
+            hr.modifierTypeAndBytesById(id).orElse(minedModifier(id)).flatMap { case (mTypeId, bytes) =>
               if (mTypeId == expectedTypeId) {
                 Some(id -> bytes)
               } else {
@@ -1432,7 +1440,9 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       * propagation latency. LocalBlockApplied arrives later and skips broadcast
       * since the block was already announced.
       */
-    case NewBlockMined(header) =>
+    case NewBlockMined(header, sections) =>
+      val served = (header +: sections).map(m => m.id -> (m.modifierTypeId -> m.bytes)).toMap
+      minedToServe = (minedToServe :+ served).takeRight(MinedBlocksToServe)
       log.info(
         s"Immediately announcing newly mined block ${header.encodedId} " +
         s"at height ${header.height} to all peers"
