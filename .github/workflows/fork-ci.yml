@@ -9,7 +9,8 @@ on:
     inputs:
       ref: { description: 'branch or commit of this fork to test', required: true }
       jobs: { description: 'which jobs: all | node | it | wallet | core (space-separated)', default: 'node it' }
-run-name: "fork CI on ${{ inputs.ref }} (${{ inputs.jobs }})"
+      itspec: { description: 'optional: run only this integration spec (it:testOnly), e.g. org.ergoplatform.it.ForkResolutionSpec', default: '' }
+run-name: "fork CI on ${{ inputs.ref }} (${{ inputs.jobs }})${{ inputs.itspec != '' && format(' [{0}]', inputs.itspec) || '' }}"
 jobs:
   test_wallet:
     if: contains(inputs.jobs, 'all') || contains(inputs.jobs, 'wallet')
@@ -95,7 +96,11 @@ jobs:
       - run: |
           cd it
           mkdir tmp
-          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} it:test
+          if [ -n "${{ inputs.itspec }}" ]; then
+            TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} "it:testOnly ${{ inputs.itspec }}"
+          else
+            TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} it:test
+          fi
       - name: Keep the suite's node logs (the containers' logs, written per spec)
         if: always()
         uses: actions/upload-artifact@v4
