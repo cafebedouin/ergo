@@ -97,7 +97,7 @@ jobs:
           cd it
           mkdir tmp
           if [ -n "${{ inputs.itspec }}" ]; then
-            TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} "it:testOnly ${{ inputs.itspec }}"
+            TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} docker "it:testOnly ${{ inputs.itspec }}"
           else
             TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} it:test
           fi
