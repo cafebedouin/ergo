@@ -63,6 +63,19 @@ class ForkResolutionSpec extends AnyFlatSpec with Matchers with IntegrationSuite
     }
   }
 
+  // FR-DIAG (experiment instrumentation, not for upstream): per-node heights and the ids /blocks/at returns
+  private def frDiag(label: String, ns: List[Node], h: Int): Unit = {
+    val rows = ns.zipWithIndex.map { case (n, i) =>
+      Try(Await.result(for {
+        inf <- n.info
+        ids <- n.headerIdsByHeight(h)
+      } yield s"n${i + 1} hdr=${inf.bestHeaderHeightOpt.getOrElse(-1)} full=${inf.bestBlockHeightOpt.getOrElse(-1)} " +
+        s"best=${inf.bestBlockIdOpt.getOrElse("-").take(8)} at$h=${ids.map(_.take(8)).mkString("|")}", 5.seconds))
+        .getOrElse(s"n${i + 1} unreachable")
+    }
+    log.info(s"FR-DIAG $label: ${rows.mkString("; ")}")
+  }
+
   // Testing scenario:
   // 1. Start up {nodesQty} nodes and let them mine common chain of length {initialCommonChainLength};
   // 2. Kill all nodes when they are done, make them offline generating, clear known peers and restart them;
@@ -78,25 +91,35 @@ class ForkResolutionSpec extends AnyFlatSpec with Matchers with IntegrationSuite
 
     val result = Async.async {
       val initMaxHeight = Async.await(Future.traverse(nodes)(_.fullHeight).map(_.max))
+      log.info(s"FR-DIAG initMaxHeight=$initMaxHeight forkHeight=${initMaxHeight + commonChainLength + forkLength}")
       Async.await(Future.traverse(nodes)(_.waitForHeight(initMaxHeight + commonChainLength, 100.millis)))
+      frDiag("phase1-end", nodes, initMaxHeight + commonChainLength + forkLength)
       val isolatedNodes = Async.await {
         nodes.foreach(node => docker.stopNode(node.containerId))
         clearPeerDatabases()
         Future.successful(startNodesWithBinds(minerConfig +: offlineMiningNodesConfig, isolatedPeersConfig))
       }
       val forkHeight = initMaxHeight + commonChainLength + forkLength
+      frDiag("phase2-start", isolatedNodes, forkHeight)
       Async.await(Future.traverse(isolatedNodes)(_.waitForHeight(forkHeight, 100.millis)))
+      frDiag("phase2-end", isolatedNodes, forkHeight)
       val regularNodes = Async.await {
         isolatedNodes.foreach(node => docker.stopNode(node.containerId))
         clearPeerDatabases()
         Future.successful(startNodesWithBinds(minerConfig +: onlineSyncNodesConfig))
       }
+      frDiag("phase3-start", regularNodes, forkHeight)
+      val diagTimer = new java.util.Timer("fr-diag", true)
+      diagTimer.schedule(new java.util.TimerTask { def run(): Unit = frDiag("phase3", regularNodes, forkHeight) }, 20000L, 30000L)
       Async.await(Future.traverse(regularNodes)(_.waitForHeight(forkHeight + syncLength, 100.millis)))
+      frDiag("phase3-heightReached", regularNodes, forkHeight)
       val sample = Async.await(regularNodes.head.headerIdsByHeight(forkHeight)).headOption.value
       val headers = Async.await(Future.traverse(regularNodes) { node =>
         node.waitFor[Seq[String]](_.headerIdsByHeight(forkHeight), _.headOption.contains(sample), 100.millis)
       })
 
+      diagTimer.cancel()
+      frDiag("phase3-agreed", regularNodes, forkHeight)
       log.debug(s"Headers at height $forkHeight: ${headers.mkString(",")}")
       val headerIdsAtSameHeight = headers.map(_.headOption.value)
       headerIdsAtSameHeight should contain only sample
