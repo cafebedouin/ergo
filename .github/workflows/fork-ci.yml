@@ -1,0 +1,98 @@
+# The same jobs as ergoplatform/ergo's ci.yml (wallet, core, node and integration tests), runnable here on any ref of this
+# fork by hand: `gh workflow run fork-ci.yml -f ref=<branch or sha>`. Upstream's ci.yml runs only on pushes to
+# master/develop and on pull_request events, so a branch pushed here never gets a CI run of its own; this workflow
+# gives every branch one, re-runnable as often as needed, without adding a file to the branch itself. The publish
+# steps of upstream's workflow are left out (no snapshots are published from this fork).
+name: fork CI (upstream jobs on a ref)
+on:
+  workflow_dispatch:
+    inputs:
+      ref: { description: 'branch or commit of this fork to test', required: true }
+      jobs: { description: 'which jobs: all | node | it | wallet | core (space-separated)', default: 'node it' }
+run-name: "fork CI on ${{ inputs.ref }} (${{ inputs.jobs }})"
+jobs:
+  test_wallet:
+    if: contains(inputs.jobs, 'all') || contains(inputs.jobs, 'wallet')
+    name: Run wallet tests
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-latest], scala: [2.13.18, 2.12.20, 2.11.12], java: [adopt@1.8] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.ref }}", fetch-depth: 0 }
+      - uses: olafurpg/setup-scala@v10
+        with: { java-version: "${{ matrix.java }}" }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - run: sbt ++${{ matrix.scala }} ergoWallet/test
+  test_core:
+    if: contains(inputs.jobs, 'all') || contains(inputs.jobs, 'core')
+    name: Run ergo-core tests
+    strategy:
+      fail-fast: false
+      matrix: { os: [ubuntu-latest], scala: [2.13.18, 2.12.20, 2.11.12], java: [adopt@1.8] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.ref }}", fetch-depth: 0 }
+      - uses: olafurpg/setup-scala@v10
+        with: { java-version: "${{ matrix.java }}" }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - run: sbt ++${{ matrix.scala }} ergoCore/test
+  test_node:
+    if: contains(inputs.jobs, 'all') || contains(inputs.jobs, 'node')
+    name: Run node tests
+    strategy:
+      matrix: { os: [ubuntu-latest], scala: [2.12.20], java: [adopt@1.8] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.ref }}", fetch-depth: 0 }
+      - uses: olafurpg/setup-scala@v10
+        with: { java-version: "${{ matrix.java }}" }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - run: sbt -Denv=test clean ++${{ matrix.scala }} test
+  test_it:
+    if: contains(inputs.jobs, 'all') || contains(inputs.jobs, 'it')
+    name: Run it node tests
+    strategy:
+      matrix: { os: [ubuntu-latest], scala: [2.12.20], java: [adopt@1.8] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ inputs.ref }}", path: it, fetch-depth: 0 }
+      - uses: olafurpg/setup-scala@v10
+        with: { java-version: "${{ matrix.java }}" }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.coursier/cache/v1
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - run: |
+          cd it
+          mkdir tmp
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++${{ matrix.scala }} it:test
