@@ -2207,14 +2207,20 @@ class ErgoNodeViewSynchronizerSpecification
 
       // The OBA references a missing previous input block, so the synchronizer first
       // requests the block transactions from the announcing peer.
-      val requestMsg = ncProbe.expectMsgClass(classOf[SendToNetwork])
+      // (a SyncInfo to the announcing peer, sent once the announced header is applied, may come first)
+      val requestMsg = ncProbe.fishForMessage(3 seconds) {
+        case stn: SendToNetwork => stn.message.spec.messageCode != ErgoSyncInfoMessageSpec.messageCode
+        case _ => false
+      }.asInstanceOf[SendToNetwork]
       requestMsg.message.spec.messageCode shouldBe RequestModifierSpec.messageCode
       val invData = requestMsg.message.data.get.asInstanceOf[InvData]
       invData.typeId shouldBe BlockTransactions.modifierTypeId
       invData.ids shouldBe Seq(oba.header.transactionsId)
 
-      // No OBA announcement should be sent to the peer far behind.
-      ncProbe.expectNoMessage(300.millis)
+      // No OBA announcement should be sent to the peer far behind (SyncInfo to the announcing peer aside).
+      ncProbe.receiveWhile(300.millis) { case m => m }.collect {
+        case stn: SendToNetwork if stn.message.spec.messageCode != ErgoSyncInfoMessageSpec.messageCode => stn
+      } shouldBe empty
     }
   }
 
@@ -2272,14 +2278,20 @@ class ErgoNodeViewSynchronizerSpecification
 
       // The OBA references a missing previous input block, so the synchronizer first
       // requests the block transactions from the announcing peer.
-      val requestMsg = ncProbe.expectMsgClass(classOf[SendToNetwork])
+      // (a SyncInfo to the announcing peer, sent once the announced header is applied, may come first)
+      val requestMsg = ncProbe.fishForMessage(3 seconds) {
+        case stn: SendToNetwork => stn.message.spec.messageCode != ErgoSyncInfoMessageSpec.messageCode
+        case _ => false
+      }.asInstanceOf[SendToNetwork]
       requestMsg.message.spec.messageCode shouldBe RequestModifierSpec.messageCode
       val invData = requestMsg.message.data.get.asInstanceOf[InvData]
       invData.typeId shouldBe BlockTransactions.modifierTypeId
       invData.ids shouldBe Seq(oba.header.transactionsId)
 
-      // No OBA announcement should be sent to the peer far ahead.
-      ncProbe.expectNoMessage(300.millis)
+      // No OBA announcement should be sent to the peer far ahead (SyncInfo to the announcing peer aside).
+      ncProbe.receiveWhile(300.millis) { case m => m }.collect {
+        case stn: SendToNetwork if stn.message.spec.messageCode != ErgoSyncInfoMessageSpec.messageCode => stn
+      } shouldBe empty
     }
   }
 
@@ -2410,7 +2422,11 @@ class ErgoNodeViewSynchronizerSpecification
 
       // The OBA references a missing previous input block, so the synchronizer first
       // requests the block transactions from the announcing peer.
-      val requestMsg = ncProbe.expectMsgClass(classOf[SendToNetwork])
+      // (a SyncInfo to the announcing peer, sent once the announced header is applied, may come first)
+      val requestMsg = ncProbe.fishForMessage(3 seconds) {
+        case stn: SendToNetwork => stn.message.spec.messageCode != ErgoSyncInfoMessageSpec.messageCode
+        case _ => false
+      }.asInstanceOf[SendToNetwork]
       requestMsg.message.spec.messageCode shouldBe RequestModifierSpec.messageCode
       val invData = requestMsg.message.data.get.asInstanceOf[InvData]
       invData.typeId shouldBe BlockTransactions.modifierTypeId
