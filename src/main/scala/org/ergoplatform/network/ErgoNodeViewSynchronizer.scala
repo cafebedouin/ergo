@@ -180,14 +180,19 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   /**
     * A peer's recorded height changes only when its SyncInfo is processed, and a follower that is in fact at the tip can
     * be recorded two or more blocks below it (#2597). For the relay filters, such a peer still counts as near the tip if
-    * it was last seen at or behind our chain (Equal or Younger) and its last SyncInfo arrived within this window.
+    * it was last seen at or behind our chain (Equal or Younger), its last SyncInfo arrived within this window, and its
+    * recorded height is at most MaxStaleLag blocks below ours. The lag is the blocks made between two of its SyncInfos
+    * (0-5 on a devnet with 15-48 s blocks); a peer further behind is still syncing, not at the tip.
     */
   private val RecentSyncWindowMs: Long = 2.minutes.toMillis
+
+  private val MaxStaleLag = 8
 
   private def nearTip(status: ErgoPeerStatus, fullBlockHeight: Int): Boolean = {
     val h = status.height
     (h <= fullBlockHeight + 2 && h >= fullBlockHeight - 2) ||
       ((status.status == Equal || status.status == Younger) &&
+        h >= fullBlockHeight - MaxStaleLag &&
         status.lastSyncGetTime.exists(t => System.currentTimeMillis() - t <= RecentSyncWindowMs))
   }
 
