@@ -197,6 +197,16 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   }
 
   /**
+    * Near the tip, peers that delivered or announced a header also get a SyncInfo once it is applied, so it carries
+    * the height after the header. A peer relays input blocks and ordering blocks only to peers within two blocks of its
+    * height, by the height of their last SyncInfo (#2597). This is in addition to the SyncInfo sent at delivery, which
+    * is unchanged; an entry is dropped on any outcome of its header, and the oldest one when the table is full.
+    */
+  private val syncAfterHeader = mutable.LinkedHashMap[ModifierId, Set[ConnectedPeer]]()
+
+  private val MaxSyncAfterHeader = 1000
+
+  /**
     * How many peers should have a utxo set snapshot to start downloading it
     */
   private lazy val MinSnapshots = settings.nodeSettings.utxoSettings.p2pUtxoSnapshots
@@ -407,6 +417,23 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   /**
     * Send sync message to a concrete peer. Used in [[processSync]] and [[processSyncV2]] methods.
     */
+  private def syncWhenHeaderApplied(headerId: ModifierId, peer: ConnectedPeer): Unit = {
+    val peers = syncAfterHeader.remove(headerId).getOrElse(Set.empty[ConnectedPeer]) + peer
+    if (syncAfterHeader.size >= MaxSyncAfterHeader) {
+      syncAfterHeader.remove(syncAfterHeader.head._1)
+    }
+    syncAfterHeader.put(headerId, peers)
+  }
+
+  private def sendSyncAfterHeader(headerId: ModifierId, history: ErgoHistory): Unit = {
+    syncAfterHeader.remove(headerId).foreach { peers =>
+      peers.foreach { peer =>
+        val syncInfo = if (syncV2Supported(peer)) getV2SyncInfo(history, full = false) else getV1SyncInfo(history)
+        sendSyncToPeer(peer, syncInfo)
+      }
+    }
+  }
+
   protected def sendSyncToPeer(remote: ConnectedPeer, sync: ErgoSyncInfo): Unit = {
     if (sync.nonEmpty) {
       syncTracker.updateLastSyncSentTime(remote)
@@ -793,6 +820,8 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
               getV1SyncInfo(hr)
             }
             sendSyncToPeer(remote, syncInfo)
+            // near the tip, once the headers are applied tell the peer our new height too
+            if (hr.isHeadersChainSynced) syncWhenHeaderApplied(valid.last.id, remote)
           }
         }
 
@@ -1937,6 +1966,8 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
       if (inputBlockStored) {
         log.info(s"Processing ordering block ${oba.header.id}") // todo: make it .debug
+        // tell the announcing peer our height once its header is applied (it relays by our last reported height)
+        syncWhenHeaderApplied(oba.header.id, remote)
         viewHolderRef ! ProcessOrderingBlock(oba)
       } else {
         // todo: request full block for now, see todo notes above
@@ -2276,9 +2307,11 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     case SyntacticallySuccessfulModifier(modTypeId, modId) =>
       deliveryTracker.setHeld(modId, modTypeId)
+      if (modTypeId == Header.modifierTypeId) sendSyncAfterHeader(modId, historyReader)
 
     case RecoverableFailedModification(modTypeId, modId, e) =>
       logger.debug(s"Setting recoverable failed modifier $modId as Unknown", e)
+      syncAfterHeader.remove(modId)
       e match {
         case phError: ParentHeaderNotFoundError =>
           // For missing parent header, request the parent header from peers if not already known
@@ -2299,10 +2332,12 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     case SyntacticallyFailedModification(modTypeId, modId, e) =>
       logger.debug(s"Invalidating syntactically failed modifier $modId", e)
+      syncAfterHeader.remove(modId)
       deliveryTracker.setInvalid(modId, modTypeId).foreach(penalizeMisbehavingPeer)
 
     case SemanticallyFailedModification(modTypeId, modId, e) =>
       logger.debug(s"Invalidating semantically failed modifier $modId", e)
+      syncAfterHeader.remove(modId)
       deliveryTracker.setInvalid(modId, modTypeId).foreach(penalizeMisbehavingPeer)
 
     case ChangedHistory(newHistoryReader: ErgoHistory) =>
