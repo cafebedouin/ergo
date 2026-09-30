@@ -2679,6 +2679,81 @@ class ErgoNodeViewSynchronizerSpecification
   }
 
   property(
+    "NodeViewSynchronizer: after an announced ordering block's header is applied, the announcing peer gets its new height"
+  ) {
+    withFixture2 { ctx =>
+      import ctx._
+      import org.ergoplatform.network.message.inputblocks.OrderingBlockAnnouncementMessageSpec
+      import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{ProcessOrderingBlock, SyntacticallySuccessfulModifier}
+      import org.ergoplatform.nodeView.history.ErgoSyncInfoV1
+      import org.ergoplatform.settings.Algos
+      import scorex.core.network.SendToPeer
+      import scorex.core.network.NetworkController.ReceivableMessages.SendToNetwork
+      import scorex.util.bytesToId
+
+      val hist  = ErgoHistory.readOrGenerate(settings)(null)
+      val chain = genChain(2, hist)
+      val wrappedState = boxesHolderGen
+        .map(WrappedUtxoState(_, createTempDir, parameters, settings))
+        .sample
+        .get
+
+      val prevIbId = bytesToId(Algos.hash("prev-input-block".getBytes))
+      hist.applyInputBlock(
+        InputBlockAnnouncement(InputBlockAnnouncement.initialMessageVersion, chain.head.header, InputBlockFields.empty, None)
+      )
+      hist.applyInputBlockTransactions(prevIbId, Seq.empty, wrappedState)
+
+      val viewHolderProbe     = TestProbe("ViewHolderProbe")
+      val testSyncTracker     = ErgoSyncTracker(settings.scorexSettings.network)
+      val testDeliveryTracker = DeliveryTracker.empty(settings)
+      val testSynchronizerRef: TestActorRef[SynchronizerMock] = TestActorRef(
+        Props(
+          new SynchronizerMock(
+            ncProbe.ref,
+            viewHolderProbe.ref,
+            ErgoSyncInfoMessageSpec,
+            settings,
+            testSyncTracker,
+            testDeliveryTracker
+          )
+        )
+      )
+      testSynchronizerRef ! ChangedState(wrappedState)
+      testSynchronizerRef ! ChangedHistory(hist)
+      testSynchronizerRef ! ChangedMempool(ErgoMemPool.empty(settings))
+      Thread.sleep(500)
+
+      val oba = buildValidOrderingBlockAnnouncement(hist.bestFullBlockOpt, Some(prevIbId))
+      testSynchronizerRef ! Message(
+        OrderingBlockAnnouncementMessageSpec,
+        Left(OrderingBlockAnnouncementMessageSpec.toBytes(oba)),
+        Some(peer)
+      )
+      viewHolderProbe.fishForMessage(3 seconds) {
+        case _: ProcessOrderingBlock => true
+        case _                       => false
+      }
+
+      // the view holder applies the announced header
+      hist.append(oba.header).get
+      hist.bestHeaderOpt.map(_.id) shouldBe Some(oba.header.id)
+      testSynchronizerRef ! SyntacticallySuccessfulModifier(Header.modifierTypeId, oba.header.id)
+
+      // the announcing peer is told the height that now includes the announced header
+      val sync = ncProbe.fishForMessage(3 seconds) {
+        case stn: SendToNetwork =>
+          stn.message.spec.messageCode == ErgoSyncInfoMessageSpec.messageCode && stn.sendingStrategy == SendToPeer(peer)
+        case _ => false
+      }.asInstanceOf[SendToNetwork]
+      sync.message.data.get match {
+        case v2: ErgoSyncInfoV2 => v2.height shouldBe Some(oba.header.height)
+        case other              => other.asInstanceOf[ErgoSyncInfoV1].lastHeaderIds should contain(oba.header.id)
+      }
+    }
+  }
+
+  property(
     "NodeViewSynchronizer: processOrderingBlockAnnouncement without stored prev input block requests BlockTransactions"
   ) {
     withFixture2 { ctx =>
