@@ -611,6 +611,54 @@ class ErgoNodeViewSynchronizerSpecification
     }
   }
 
+  property(
+    "NodeViewSynchronizer: a delivered header gets its SyncInfo without waiting for the header to be applied"
+  ) {
+    withFixture2 { ctx =>
+      import ctx._
+      import scorex.core.network.SendToPeer
+      import scorex.core.network.NetworkController.ReceivableMessages.SendToNetwork
+
+      // a history with some headers, so this node's SyncInfo is not empty (an empty one is never sent)
+      val hist = ErgoHistory.readOrGenerate(settings)(null)
+      val chain = genHeaderChain(4, hist, diffBitsOpt = None, useRealTs = false).headers
+      chain.init.foreach(h => hist.append(h).get)
+      val header = chain.last
+
+      // a view holder that never applies anything: no SyntacticallySuccessfulModifier will follow
+      val viewHolderProbe     = TestProbe("ViewHolderProbe")
+      val testSyncTracker     = ErgoSyncTracker(settings.scorexSettings.network)
+      val testDeliveryTracker = DeliveryTracker.empty(settings)
+      val testSynchronizerRef: TestActorRef[SynchronizerMock] = TestActorRef(
+        Props(
+          new SynchronizerMock(
+            ncProbe.ref,
+            viewHolderProbe.ref,
+            ErgoSyncInfoMessageSpec,
+            settings,
+            testSyncTracker,
+            testDeliveryTracker
+          )
+        )
+      )
+      testSynchronizerRef ! ChangedHistory(hist)
+      testSynchronizerRef ! ChangedMempool(ErgoMemPool.empty(settings))
+      Thread.sleep(500)
+
+      testDeliveryTracker.setRequested(Header.modifierTypeId, header.id, peer)(_ => Cancellable.alreadyCancelled)
+      val modData = ModifiersData(Header.modifierTypeId, Map(header.id -> header.bytes))
+      testSynchronizerRef ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(modData)), Some(peer))
+
+      // the delivering peer is synced at once, as before (the header may never produce an application event,
+      // e.g. when another peer's copy of it was applied first)
+      ncProbe.fishForMessage(3 seconds) {
+        case stn: SendToNetwork =>
+          stn.message.spec.messageCode == ErgoSyncInfoMessageSpec.messageCode && stn.sendingStrategy == SendToPeer(peer)
+        case _ => false
+      }
+    }
+  }
+
   property("NodeViewSynchronizer: receiving out-of-order header should request it again") {
     withFixture2 { ctx =>
       import ctx._
