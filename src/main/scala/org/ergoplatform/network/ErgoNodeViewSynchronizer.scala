@@ -192,6 +192,16 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   }
 
   /**
+    * Headers whose SyncInfo to the peer that delivered or announced them is sent once they are applied, so the SyncInfo
+    * carries the height after the header, not before it. A peer relaying input blocks and ordering blocks keeps only
+    * peers within two blocks of its height in its relay set, by the height of their last SyncInfo (#2597). Bounded; an
+    * entry is sent when its header is applied, or at once when its application fails (as before).
+    */
+  private val syncAfterHeader = mutable.LinkedHashMap[ModifierId, ConnectedPeer]()
+
+  private val MaxSyncAfterHeader = 1000
+
+  /**
     * How many peers should have a utxo set snapshot to start downloading it
     */
   private lazy val MinSnapshots = settings.nodeSettings.utxoSettings.p2pUtxoSnapshots
@@ -402,6 +412,20 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   /**
     * Send sync message to a concrete peer. Used in [[processSync]] and [[processSyncV2]] methods.
     */
+  private def syncWhenHeaderApplied(headerId: ModifierId, peer: ConnectedPeer): Unit = {
+    if (syncAfterHeader.size >= MaxSyncAfterHeader) {
+      syncAfterHeader.remove(syncAfterHeader.head._1)
+    }
+    syncAfterHeader.put(headerId, peer)
+  }
+
+  private def sendSyncAfterHeader(headerId: ModifierId, history: ErgoHistory): Unit = {
+    syncAfterHeader.remove(headerId).foreach { peer =>
+      val syncInfo = if (syncV2Supported(peer)) getV2SyncInfo(history, full = false) else getV1SyncInfo(history)
+      sendSyncToPeer(peer, syncInfo)
+    }
+  }
+
   protected def sendSyncToPeer(remote: ConnectedPeer, sync: ErgoSyncInfo): Unit = {
     if (sync.nonEmpty) {
       syncTracker.updateLastSyncSentTime(remote)
@@ -780,14 +804,9 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
           log.debug(s"Sending ${valid.size} modifiers to view holder, vh cache size: $modifiersCacheSize")
           modifiersCacheSize += valid.size // we increase estimated cache size now, before getting a precise number
           viewHolderRef ! ModifiersFromRemote(valid)
-          // send sync message to the peer to get new headers quickly
+          // send sync message to the peer to get new headers quickly, once the last of these headers is applied
           if (valid.head.isInstanceOf[Header]) {
-            val syncInfo = if (syncV2Supported(remote)) {
-              getV2SyncInfo(hr, full = false)
-            } else {
-              getV1SyncInfo(hr)
-            }
-            sendSyncToPeer(remote, syncInfo)
+            syncWhenHeaderApplied(valid.last.id, remote)
           }
         }
 
@@ -1932,6 +1951,8 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
       if (inputBlockStored) {
         log.info(s"Processing ordering block ${oba.header.id}") // todo: make it .debug
+        // tell the announcing peer our height once its header is applied (it relays by our last reported height)
+        syncWhenHeaderApplied(oba.header.id, remote)
         viewHolderRef ! ProcessOrderingBlock(oba)
       } else {
         // todo: request full block for now, see todo notes above
@@ -2271,9 +2292,11 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     case SyntacticallySuccessfulModifier(modTypeId, modId) =>
       deliveryTracker.setHeld(modId, modTypeId)
+      if (modTypeId == Header.modifierTypeId) sendSyncAfterHeader(modId, historyReader)
 
     case RecoverableFailedModification(modTypeId, modId, e) =>
       logger.debug(s"Setting recoverable failed modifier $modId as Unknown", e)
+      if (modTypeId == Header.modifierTypeId) sendSyncAfterHeader(modId, historyReader)
       e match {
         case phError: ParentHeaderNotFoundError =>
           // For missing parent header, request the parent header from peers if not already known
@@ -2294,6 +2317,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     case SyntacticallyFailedModification(modTypeId, modId, e) =>
       logger.debug(s"Invalidating syntactically failed modifier $modId", e)
+      if (modTypeId == Header.modifierTypeId) sendSyncAfterHeader(modId, historyReader)
       deliveryTracker.setInvalid(modId, modTypeId).foreach(penalizeMisbehavingPeer)
 
     case SemanticallyFailedModification(modTypeId, modId, e) =>
