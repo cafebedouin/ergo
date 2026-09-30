@@ -1067,6 +1067,72 @@ class ErgoNodeViewSynchronizerSpecification
   }
 
   property(
+    "NodeViewSynchronizer: a local input block reaches an Equal peer with a stale tracked height but a recent sync"
+  ) {
+    withFixture2 { ctx =>
+      import ctx._
+      import org.ergoplatform.consensus.Equal
+      import org.ergoplatform.network.message.inputblocks.InputBlockMessageSpec
+      import org.ergoplatform.network.{PeerSpec, Version}
+      import org.ergoplatform.network.peer.PeerInfo
+      import org.ergoplatform.utils.generators.ChainGenerator.applyChain
+      import scorex.core.network.{ConnectedPeer, SendToPeers}
+      import scorex.core.network.NetworkController.ReceivableMessages.SendToNetwork
+
+      val hist = ErgoHistory.readOrGenerate(settings)(null)
+      applyChain(hist, genChain(6, hist))
+      val fullHeight = hist.fullBlockHeight
+      val header = genChain(3, hist).map(_.header).find(_.height == fullHeight + 1).get
+      header.height shouldBe fullHeight + 1
+
+      val wrappedState = boxesHolderGen
+        .map(WrappedUtxoState(_, createTempDir, parameters, settings))
+        .sample
+        .get
+      synchronizerMockRef ! ChangedState(wrappedState)
+      synchronizerMockRef ! ChangedHistory(hist)
+      synchronizerMockRef ! ChangedMempool(ErgoMemPool.empty(settings))
+      Thread.sleep(500)
+
+      hist.applyInputBlock(
+        InputBlockAnnouncement(InputBlockAnnouncement.initialMessageVersion, header, InputBlockFields.empty, None)
+      )
+
+      val subBlocksPeerSpec = PeerSpec(
+        settings.scorexSettings.network.agentName,
+        Version.SubblocksVersion,
+        settings.scorexSettings.network.nodeName,
+        None,
+        Seq(ModePeerFeature(StateType.Utxo, verifyingTransactions = true, None, -1))
+      )
+      def subBlocksPeer(): ConnectedPeer = ConnectedPeer(
+        connectionIdGen.sample.get,
+        pchProbe.ref,
+        Some(PeerInfo(subBlocksPeerSpec, System.currentTimeMillis()))
+      )
+      // both at the tip in fact, both recorded 3 below it (their last SyncInfo predates the latest headers)
+      val recentlySynced = subBlocksPeer()
+      val silent = subBlocksPeer()
+      syncTracker.updateStatus(recentlySynced, Equal, Some(fullHeight - 3))
+      syncTracker.updateLastSyncGetTime(recentlySynced)
+      syncTracker.updateStatus(silent, Equal, Some(fullHeight - 3))
+
+      synchronizerMockRef ! NewBestInputBlock(Some(header.id), local = true)
+
+      val msg = ncProbe.fishForMessage(3 seconds) {
+        case stn: SendToNetwork => stn.message.spec.messageCode == InputBlockMessageSpec.messageCode
+        case _ => false
+      }.asInstanceOf[SendToNetwork]
+      msg.sendingStrategy match {
+        case SendToPeers(peers) =>
+          peers should contain(recentlySynced)
+          peers should not contain silent
+        case other => fail(s"Expected SendToPeers, got $other")
+      }
+    }
+  }
+
+  property(
     "NodeViewSynchronizer: NewBestInputBlock(local=true) broadcasts IBI with txs when <= 3 transactions"
   ) {
     withFixture2 { ctx =>
