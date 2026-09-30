@@ -1071,7 +1071,7 @@ class ErgoNodeViewSynchronizerSpecification
   ) {
     withFixture2 { ctx =>
       import ctx._
-      import org.ergoplatform.consensus.Equal
+      import org.ergoplatform.consensus.{Equal, Younger}
       import org.ergoplatform.network.message.inputblocks.InputBlockMessageSpec
       import org.ergoplatform.network.{PeerSpec, Version}
       import org.ergoplatform.network.peer.PeerInfo
@@ -1116,6 +1116,10 @@ class ErgoNodeViewSynchronizerSpecification
       syncTracker.updateStatus(recentlySynced, Equal, Some(fullHeight - 3))
       syncTracker.updateLastSyncGetTime(recentlySynced)
       syncTracker.updateStatus(silent, Equal, Some(fullHeight - 3))
+      // recently synced but really far behind (still syncing): not near the tip
+      val farBehind = subBlocksPeer()
+      syncTracker.updateStatus(farBehind, Younger, Some(fullHeight - 20))
+      syncTracker.updateLastSyncGetTime(farBehind)
 
       synchronizerMockRef ! NewBestInputBlock(Some(header.id), local = true)
 
@@ -1127,6 +1131,7 @@ class ErgoNodeViewSynchronizerSpecification
         case SendToPeers(peers) =>
           peers should contain(recentlySynced)
           peers should not contain silent
+          peers should not contain farBehind
         case other => fail(s"Expected SendToPeers, got $other")
       }
     }
