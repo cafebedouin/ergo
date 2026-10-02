@@ -30,7 +30,7 @@ jobs:
         run: |
           mkdir -p tmp
           set -o pipefail
-          TMPDIR=$(pwd)/tmp sbt -Denv=test ++2.12.20 "it:testOnly org.ergoplatform.it.DeepRollBackSpec" 2>&1 | tee sbt-output.log
+          TMPDIR=$(pwd)/tmp sbt -Denv=test ++2.12.20 docker "it:testOnly org.ergoplatform.it.DeepRollBackSpec" 2>&1 | tee sbt-output.log
       - name: Upload node logs and sbt output
         if: always()
         uses: actions/upload-artifact@v4
