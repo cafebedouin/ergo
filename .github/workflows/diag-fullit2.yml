@@ -1,0 +1,43 @@
+name: diag-fullit2
+# The whole it:test suite (as upstream CI runs it), twice, uploading every node log (target/logs) and the sbt output, so
+# a DeepRollBackSpec timeout in suite context is captured with its logs. Runs on pushes to diag/fullit-* only.
+on:
+  push:
+    branches: [ 'diag/fullit2-*' ]
+jobs:
+  fullit:
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [ 1, 2, 3, 4 ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: it:test (whole suite)
+        run: |
+          mkdir -p tmp
+          set -o pipefail
+          TMPDIR=$(pwd)/tmp sbt -Denv=test ++2.12.20 it:test 2>&1 | tee sbt-output.log
+      - name: Upload node logs and sbt output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fullit2-${{ github.ref_name == 'diag/fullit2-v608-2526' && 'v608-2526' || 'v608' }}-run-${{ matrix.run }}
+          path: |
+            target/logs/
+            sbt-output.log
+          if-no-files-found: warn
+          retention-days: 14
