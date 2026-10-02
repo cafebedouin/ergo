@@ -1,0 +1,43 @@
+name: diag-deeprollback
+# DeepRollBackSpec, five independent runs, each uploading every node's container log (target/logs, written by the it
+# framework's Docker.close) and the sbt output. Runs on pushes to diag/deeprollback-* only.
+on:
+  push:
+    branches: [ 'diag/deeprollback-*' ]
+jobs:
+  deeprollback:
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [ 1, 2, 3, 4, 5 ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: DeepRollBackSpec
+        run: |
+          mkdir -p tmp
+          set -o pipefail
+          TMPDIR=$(pwd)/tmp sbt -Denv=test ++2.12.20 "it:testOnly org.ergoplatform.it.DeepRollBackSpec" 2>&1 | tee sbt-output.log
+      - name: Upload node logs and sbt output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deeprollback-${{ github.ref_name == 'diag/deeprollback-head' && 'head' || 'base' }}-run-${{ matrix.run }}
+          path: |
+            target/logs/
+            sbt-output.log
+          if-no-files-found: warn
+          retention-days: 14
