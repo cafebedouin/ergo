@@ -75,10 +75,11 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
   private var syncInfoV1CacheByHeadersHeight: Option[(Int, ErgoSyncInfoV1)] = Option.empty
 
-  // full and reduced V2 sync infos differ, so they are cached separately
-  private var fullSyncInfoV2CacheByHeadersHeight: Option[(Int, ErgoSyncInfoV2)] = Option.empty
+  // full and reduced V2 sync infos differ, so they are cached separately, each keyed by the best header it was built
+  // from: the best header can change while the headers height stays the same
+  private var fullSyncInfoV2CacheByBestHeader: Option[(Option[ModifierId], ErgoSyncInfoV2)] = Option.empty
 
-  private var reducedSyncInfoV2CacheByHeadersHeight: Option[(Int, ErgoSyncInfoV2)] = Option.empty
+  private var reducedSyncInfoV2CacheByBestHeader: Option[(Option[ModifierId], ErgoSyncInfoV2)] = Option.empty
 
   private val networkSettings: NetworkSettings = settings.scorexSettings.network
 
@@ -318,16 +319,16 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
   /** Get V2 sync info from cache or load it from history and add to cache */
   private def getV2SyncInfo(history: ErgoHistory, full: Boolean): ErgoSyncInfoV2 = {
-    val headersHeight = history.headersHeight
-    val cache = if (full) fullSyncInfoV2CacheByHeadersHeight else reducedSyncInfoV2CacheByHeadersHeight
+    val bestHeaderId = history.bestHeaderIdOpt
+    val cache = if (full) fullSyncInfoV2CacheByBestHeader else reducedSyncInfoV2CacheByBestHeader
     cache
-      .collect { case (height, syncInfo) if height == headersHeight => syncInfo }
+      .collect { case (tip, syncInfo) if tip == bestHeaderId => syncInfo }
       .getOrElse {
         val v2SyncInfo = history.syncInfoV2(full)
         if (full) {
-          fullSyncInfoV2CacheByHeadersHeight = Some(headersHeight -> v2SyncInfo)
+          fullSyncInfoV2CacheByBestHeader = Some(bestHeaderId -> v2SyncInfo)
         } else {
-          reducedSyncInfoV2CacheByHeadersHeight = Some(headersHeight -> v2SyncInfo)
+          reducedSyncInfoV2CacheByBestHeader = Some(bestHeaderId -> v2SyncInfo)
         }
         v2SyncInfo
       }
