@@ -1591,4 +1591,30 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
     }
   }
 
+  property("peer in 10M..15M window fills tx cache and stops intake for ALL peers") {
+    withDeclinedTransactionsFixture { ctx =>
+      import ctx._
+      val attacker = newPeer
+      val honest = newPeer
+      // 50 free declines -> attacker per-peer cost == 10M: deliveries now go to cache, invs still served (<= 15M)
+      declineTxs(attacker, count = 50, cost = 1000)
+      // attacker announces many txs before delivering any; each inv is served
+      val txs = Seq.fill(60)(dummyDeclinedTx())
+      txs.foreach(tx => invTxAndExpectRequest(attacker, tx))
+      // attacker delivers all of them -> all go to txProcessingCache (peer cost >= MempoolPeerCostPerBlock)
+      val modData = ModifiersData(ErgoTransaction.modifierTypeId, txs.map(tx => tx.id -> tx.bytes).toMap)
+      synchronizerRef ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(modData)), Some(attacker))
+      // view holder got nothing to process (all cached, cache processing chain never started)
+      val toVh = vhProbe.receiveWhile(1.second) { case m => m }
+      toVh.collect { case t: ErgoNodeViewHolder.ReceivableMessages.TransactionFromRemote => t } shouldBe empty
+      // honest peer is now refused too: cache size 60 > MaxProcessingTransactionsCacheSize (50)
+      invTxAndExpectNoRequest(honest, dummyDeclinedTx())
+      invTxAndExpectNoRequest(newPeer, dummyDeclinedTx())
+      // still stalled later: nothing but a block restarts cache processing
+      vhProbe.receiveWhile(1.second) { case m => m }.collect {
+        case t: ErgoNodeViewHolder.ReceivableMessages.TransactionFromRemote => t } shouldBe empty
+      synchronizerRef ! RemoteBlockApplied(declinedHistory.bestHeaderOpt.get, Seq.empty)
+      vhProbe.fishForMessage(5.seconds) { case _: ErgoNodeViewHolder.ReceivableMessages.TransactionFromRemote => true; case _ => false }
+    }
+  }
 }
