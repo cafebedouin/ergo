@@ -1,15 +1,15 @@
-name: diag-forkres2
+name: diag-forkres3
 # ForkResolutionSpec, five independent runs, each uploading every node's container log (target/logs, written by the it
 # framework's Docker.close) and the sbt output. Runs on pushes to diag/forkres-* only.
 on:
   push:
-    branches: [ 'diag/forkres2-*' ]
+    branches: [ 'diag/forkres3-*' ]
 jobs:
   deeprollback:
     strategy:
       fail-fast: false
       matrix:
-        run: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ]
+        run: [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 ]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -35,7 +35,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: forkres2-${{ github.ref_name == 'diag/forkres2-anchor' && 'anchor' || 'head' }}-run-${{ matrix.run }}
+          name: forkres3-${{ github.ref_name == 'diag/forkres3-anchor' && 'anchor' || 'head' }}-run-${{ matrix.run }}
           path: |
             target/logs/
             sbt-output.log
