@@ -22,6 +22,10 @@ jobs:
             ~/.ivy2/cache
             ~/.cache/coursier/v1
           key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
       - name: Replay
         run: bash diag/replay.sh
       - name: Upload results
