@@ -68,9 +68,11 @@ class Parameters(val height: Height,
   lazy val maxBlockCost: Int = parametersTable(MaxBlockCostIncrease)
 
   /**
-    * Number of sub-blocks per block, on average
+    * Number of sub-blocks per block, on average.
+    * Tables parsed from extensions written before 6.0 activation carry no key 9; for them the value
+    * inserted on 6.0 activation is used, as ErgoStateContext.processExtension does.
     */
-  lazy val subBlocksPerBlock: Int = parametersTable(SubblocksPerBlockIncrease)
+  lazy val subBlocksPerBlock: Int = subBlocksPerBlockOpt.getOrElse(SubblocksPerBlockDefault)
 
   lazy val subBlocksPerBlockOpt: Option[Int] = parametersTable.get(SubblocksPerBlockIncrease)
 
