@@ -86,7 +86,7 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
 
       val trueBoxes = ErgoState.newBoxes(genesis.transactions).filter(_.ergoTree == TrueTree)
       trueBoxes.nonEmpty shouldBe true
-      val box = trueBoxes.maxBy(_.value)
+      val box = trueBoxes.filter(_.additionalTokens.isEmpty).sortBy(-_.value).headOption.getOrElse(trueBoxes.maxBy(_.value))
       val aTx = split(box)
       val bTx = spend(aTx.outputs(0))
       val sTx = spend(aTx.outputs(1))
@@ -168,7 +168,10 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
     val genesis = validFullBlock(parentOpt = None, us, bh)
     applyBlock(genesis).isSuccess shouldBe true
     val wus = WrappedUtxoState(us, bh, fixture.settings).applyModifier(genesis)(_ => ()).get
-    val box = ErgoState.newBoxes(genesis.transactions).filter(_.ergoTree == TrueTree).maxBy(_.value)
+    // an anyone-can-spend genesis output, preferably without tokens (split keeps tokens on its first output anyway)
+    val trueBoxes = ErgoState.newBoxes(genesis.transactions).filter(_.ergoTree == TrueTree)
+    trueBoxes.nonEmpty shouldBe true
+    val box = trueBoxes.filter(_.additionalTokens.isEmpty).sortBy(-_.value).headOption.getOrElse(trueBoxes.maxBy(_.value))
     val aTx = split(box)
     (genesis, wus, aTx, spend(aTx.outputs(0)), spend(aTx.outputs(1)))
   }
@@ -203,6 +206,9 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
 
       nodeViewHolderRef ! ProcessInputBlock(a, peer(fixture))
       nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(a.id, Seq(aTx)))
+      // the fixture's first input block is valid (a fixture problem would otherwise read as a later failure)
+      awaitCondition(10.seconds)(getHistory.getInputBlockValidity(a.id).isDefined) shouldBe true
+      getHistory.getInputBlockValidity(a.id) shouldBe Some(true)
       // X is mined by this node
       nodeViewHolderRef ! LocallyGeneratedInputBlock(x, InputBlockTransactionsData(x.id, Seq(xTx)))
       awaitCondition(10.seconds)(getHistory.bestInputBlocksChain() == Seq(x.id, a.id)) shouldBe true
@@ -242,6 +248,9 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
 
       nodeViewHolderRef ! ProcessInputBlock(a, peer(fixture))
       nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(a.id, Seq(aTx)))
+      // the fixture's first input block is valid (a fixture problem would otherwise read as a later failure)
+      awaitCondition(10.seconds)(getHistory.getInputBlockValidity(a.id).isDefined) shouldBe true
+      getHistory.getInputBlockValidity(a.id) shouldBe Some(true)
       nodeViewHolderRef ! ProcessInputBlock(c, peer(fixture))
       nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(c.id, Seq(cTx)))
       nodeViewHolderRef ! ProcessInputBlock(s, peer(fixture))

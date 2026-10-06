@@ -41,13 +41,17 @@ trait InputBlockUnclesTestHelpers { self: Matchers =>
   def spend(box: ErgoBox): ErgoTransaction =
     new ErgoTransaction(IndexedSeq(Input(box.id, ProverResult.empty)), IndexedSeq.empty, IndexedSeq(box.toCandidate))
 
-  /** Spends a box into two outputs (same creation height as the box): conflicts with spend(box). */
+  /**
+    * Spends a box into two outputs (same creation height as the box): conflicts with spend(box). The box's tokens
+    * all go to the first output, so they are conserved.
+    */
   def split(box: ErgoBox): ErgoTransaction = {
     val half = box.value / 2
     val height = box.creationHeight
+    val noTokens = box.additionalTokens.slice(0, 0)
     new ErgoTransaction(IndexedSeq(Input(box.id, ProverResult.empty)), IndexedSeq.empty, IndexedSeq(
       new ErgoBoxCandidate(half, box.ergoTree, height, box.additionalTokens, box.additionalRegisters),
-      new ErgoBoxCandidate(box.value - half, box.ergoTree, height, box.additionalTokens, box.additionalRegisters)))
+      new ErgoBoxCandidate(box.value - half, box.ergoTree, height, noTokens, box.additionalRegisters)))
   }
 
   val boxes: Seq[ErgoBox] = (1 to 6).map(i => trueBox(s"uncles-box-$i"))
