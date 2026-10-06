@@ -23,7 +23,7 @@ import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
 import org.ergoplatform.nodeView.state.{ErgoState, ErgoStateContext, UtxoStateReader}
 import org.ergoplatform.sdk.wallet.Constants.MaxAssetsPerBox
 import org.ergoplatform.settings.{Algos, ErgoSettings, ErgoValidationSettingsUpdate, Parameters}
-import org.ergoplatform.subblocks.InputBlockAnnouncement
+import org.ergoplatform.subblocks.{InputBlockAnnouncement, InputBlockUncles}
 import org.ergoplatform.validation.SoftFieldsAccessError
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
 import org.ergoplatform.{AutolykosSolution, ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input, InputSolutionFound, OrderingSolutionFound, SolutionFound}
@@ -204,8 +204,11 @@ class CandidateGenerator(
       val selectedInputBlockId = state.hr.bestBlocks._2.map(_.id)
       lazy val selectedInputTransactionsDigest = Algos.merkleTreeRoot(
         state.hr.getBestOrderingCollectedInputBlocksTransactions().map(tx => LeafData @@ tx.serializedId))
+      // siblings which could be merged as uncles: a new one (e.g. validated after the candidate was built) makes
+      // the candidate stale (always empty with uncles disabled)
+      lazy val uncleCandidates = state.hr.mergeableUncleCandidates()
       if (!forced && cachedFor(state.cachedCandidate, txsToInclude, effectiveMinerPk,
-        selectedInputBlockId, selectedInputTransactionsDigest)) {
+        selectedInputBlockId, selectedInputTransactionsDigest, uncleCandidates)) {
         senderOpt.foreach(_ ! StatusReply.success(state.cachedCandidate.get))
       } else {
         val start = System.currentTimeMillis()
@@ -292,23 +295,35 @@ class CandidateGenerator(
           case _: InputSolutionFound if state.cachedCandidate.isEmpty =>
             StatusReply.error("No candidate for the input-block solution")
           case _: InputSolutionFound =>
-            val cachedCandidate = state.cachedCandidate.get
-            val (sbi, sbt) = completeInputBlock(cachedCandidate.candidateBlock, solution)
-            val parameters = cachedCandidate.parameters
-            val powValid = ergoSettings.chainSettings.powScheme.checkInputBlockPoW(sbi.header, parameters)
-            if (powValid) { // check PoW only
-              log.info(s"Input-block ${sbi.id} mined @ height ${sbi.header.height}!")
-              sendInputToNodeView(sbi, sbt)
-              context.become(initialized(state.copy(
-                cachedCandidate = None,
-                previousCandidates = withPrevious(state.cachedCandidate, state.previousCandidates))))
-              StatusReply.success(())
+            // With uncles enabled, the solution is judged against the candidate it was mined on: the current one
+            // or an earlier one on the same parent. A block from an earlier candidate links an input block which
+            // may no longer be the tip, so it becomes a sibling which a later input block can merge as an uncle.
+            val candidates = if (ergoSettings.nodeSettings.inputBlockUncles) {
+              state.cachedCandidate.toList ++ state.previousCandidates
             } else {
-              // the solution was found on an earlier candidate; keep the current one, the miner gets it on its next poll
-              log.warn(s"Input-block solution does not fit the current candidate")
-              StatusReply.error(
-                new Exception(s"Invalid input block! PoW valid: $powValid")
-              )
+              state.cachedCandidate.toList
+            }
+            val powScheme = ergoSettings.chainSettings.powScheme
+            inputSolutionCandidate(candidates, solution, powScheme.checkInputBlockPoW) match {
+              case Some((source, sbi, sbt)) if state.cachedCandidate.exists(_ eq source) => // check PoW only
+                log.info(s"Input-block ${sbi.id} mined @ height ${sbi.header.height}!")
+                sendInputToNodeView(sbi, sbt)
+                context.become(initialized(state.copy(
+                  cachedCandidate = None,
+                  previousCandidates = withPrevious(state.cachedCandidate, state.previousCandidates))))
+                StatusReply.success(())
+              case Some((_, sbi, sbt)) =>
+                // mined on an earlier candidate; the current candidate stays (it is regenerated when the new
+                // block becomes an uncle candidate or the best input block)
+                log.info(s"Input-block ${sbi.id} mined @ height ${sbi.header.height} on an earlier candidate")
+                sendInputToNodeView(sbi, sbt)
+                StatusReply.success(())
+              case None =>
+                // the solution was found on an earlier candidate; keep the current one, the miner gets it on its next poll
+                log.warn(s"Input-block solution does not fit the current candidate")
+                StatusReply.error(
+                  new Exception(s"Invalid input block! PoW valid: false")
+                )
             }
         }
       }
@@ -334,12 +349,15 @@ object CandidateGenerator extends ScorexLogging {
     * @param externalVersion - message for external miner
     * @param txsToInclude    - transactions which were prioritized for inclusion in the block candidate
     * @param parameters      - blockchain parameters at the time of candidate creation
+    * @param consideredUncles - uncle candidates known when the candidate was built (input-block uncles enabled
+    *                         only); the ones merged are in candidateBlock.inputBlockFields.uncleIds
     */
   case class Candidate(
     candidateBlock: CandidateBlock,
     externalVersion: WorkMessage,
     txsToInclude: Seq[ErgoTransaction],
-    parameters: Parameters
+    parameters: Parameters,
+    consideredUncles: Seq[ModifierId] = Seq.empty
   )
 
   /** Sent by a mining thread to receive every new default candidate as soon as it is built. */
@@ -405,10 +423,12 @@ object CandidateGenerator extends ScorexLogging {
     txs: Seq[ErgoTransaction],
     minerPk: ProveDlog,
     selectedInputBlockId: Option[ModifierId] = None,
-    selectedInputTransactionsDigest: Digest32 = Algos.emptyMerkleTreeRoot
+    selectedInputTransactionsDigest: Digest32 = Algos.emptyMerkleTreeRoot,
+    uncleCandidates: Seq[ModifierId] = Seq.empty
   ): Boolean = {
     candidateOpt.isDefined && candidateOpt.exists { c =>
       c.externalVersion.pk == minerPk &&
+        c.consideredUncles.toSet == uncleCandidates.toSet &&
         c.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) == selectedInputBlockId &&
         (selectedInputBlockId.isEmpty || java.util.Arrays.equals(
           c.candidateBlock.inputBlockFields.prevTransactionsDigest, selectedInputTransactionsDigest)) &&
@@ -733,8 +753,8 @@ object CandidateGenerator extends ScorexLogging {
 
       // form input block related data
       val parentInputBlockIdOpt = bestInputBlock.map(bestInput => idToBytes(bestInput.id))
-      val previousOrderingBlockTransactions = history.getBestOrderingCollectedInputBlocksTransactions()
-      val previousOrderingBlockTransactionIds = previousOrderingBlockTransactions.map(_.id)
+      // collected transactions of the best input block chain (L of its tip)
+      val bestCollectedTransactions = history.getBestOrderingCollectedInputBlocksTransactions()
 
       /*
       * Forming transactions to get included
@@ -760,6 +780,45 @@ object CandidateGenerator extends ScorexLogging {
         500000
       }
 
+      // Input-block uncles: siblings merged by this candidate as an input block. Their deduplicated transactions
+      // follow the tip's collected ones: L = L(tip) ++ uncles' transactions ++ this block's transactions.
+      val unclesEnabled = ergoSettings.nodeSettings.inputBlockUncles
+      val consideredUncles =
+        if (unclesEnabled && bestInputBlock.isDefined) history.mergeableUncleCandidates() else Seq.empty
+      val (uncleIds, uncleTransactions) = bestHeaderOpt match {
+        case Some(parentHeader) if consideredUncles.nonEmpty =>
+          val validationState = state.withTransactions(Seq.empty)
+          val params = state.stateContext.currentParameters
+          selectUncles(
+            consideredUncles.flatMap(id => history.getInputBlockTransactions(id).map(id -> _)),
+            bestCollectedTransactions,
+            history.getBestOrderingCollectedCost(),
+            params.maxBlockCost.toLong - InputBlockUncles.RewardCostReserve,
+            params.maxBlockSize.toLong - InputBlockUncles.RewardSizeReserve,
+            (uncleTxs, prefixTxs) => validationState.applyInputBlock(uncleTxs, prefixTxs, parentHeader)
+          )
+        case _ => (Seq.empty, Seq.empty)
+      }
+      if (uncleIds.nonEmpty) {
+        log.info(s"Candidate merges uncles ${uncleIds.mkString(", ")} with ${uncleTransactions.size} transactions")
+      }
+      // uncles field of the extension: present (possibly empty) iff uncles are enabled
+      val uncleField: Option[Seq[Array[Byte]]] = if (unclesEnabled) Some(uncleIds.map(idToBytes)) else None
+      val previousOrderingBlockTransactions = bestCollectedTransactions ++ uncleTransactions
+      val previousOrderingBlockTransactionIds = previousOrderingBlockTransactions.map(_.id)
+
+      // with uncles enabled, collected transactions of an input block must leave room for reward transactions
+      val collectCostLimit = if (unclesEnabled) {
+        state.stateContext.currentParameters.maxBlockCost - math.max(safeGap, InputBlockUncles.RewardCostReserve.toInt)
+      } else {
+        state.stateContext.currentParameters.maxBlockCost - safeGap
+      }
+      val collectSizeLimit = if (unclesEnabled) {
+        state.stateContext.currentParameters.maxBlockSize - InputBlockUncles.RewardSizeReserve.toInt
+      } else {
+        state.stateContext.currentParameters.maxBlockSize
+      }
+
       // new transactions coming from API (prioritizedTransactions), mempool, and also emission transaction
       // to spread to next input and ordering blocks
       // within collectTxs(), transactions from previous input blocks will be accounted in addition to the new txs
@@ -767,8 +826,8 @@ object CandidateGenerator extends ScorexLogging {
 
       val collected = Try(collectTxs(
         minerPk,
-        state.stateContext.currentParameters.maxBlockCost - safeGap,
-        state.stateContext.currentParameters.maxBlockSize,
+        collectCostLimit,
+        collectSizeLimit,
         state,
         upcomingContext,
         newTransactionCandidates,
@@ -803,15 +862,18 @@ object CandidateGenerator extends ScorexLogging {
       val inputBlockTransactionsDigestValue = Algos.merkleTreeRoot(inputBlockTransactions.map(tx => LeafData @@ tx.serializedId))
 
       // digest (Merkle tree root) first class transactions since ordering block till last input-block
-      val previousInputBlocksTransactionsDigest = Algos.merkleTreeRoot(previousOrderingBlockTransactionIds.map(id => LeafData @@ idToBytes(id)))
+      // (uncles' transactions are not included, so the digest identifies the selected tip's L as in cachedFor)
+      val previousInputBlocksTransactionsDigest = Algos.merkleTreeRoot(bestCollectedTransactions.map(tx => LeafData @@ idToBytes(tx.id)))
 
-      val inputBlockExtCandidate = InputBlockFields.toExtensionFields(parentInputBlockIdOpt, inputBlockTransactionsDigestValue, inputBlockTransactionsDigestValue)
+      val inputBlockExtCandidate = InputBlockFields.toExtensionFields(parentInputBlockIdOpt, inputBlockTransactionsDigestValue,
+        inputBlockTransactionsDigestValue, uncleField)
 
       val extensionCandidate = preExtensionCandidate ++ inputBlockExtCandidate
 
       val inputBlockFields = extensionCandidate.proofForInputBlockData match {
         case Some(inputBlockFieldsProof) =>
-          new InputBlockFields(parentInputBlockIdOpt, inputBlockTransactionsDigestValue, previousInputBlocksTransactionsDigest, inputBlockFieldsProof)
+          new InputBlockFields(parentInputBlockIdOpt, inputBlockTransactionsDigestValue, previousInputBlocksTransactionsDigest,
+            inputBlockFieldsProof, uncleField)
         case None =>
           throw new IllegalArgumentException("Input block fields proof not available in extension candidate")
       }
@@ -851,7 +913,7 @@ object CandidateGenerator extends ScorexLogging {
           s"Got candidate block at height ${ErgoHistoryUtils.heightOf(candidate.parentOpt) + 1}" +
           s" with ${candidate.transactions.size} transactions, msg ${Base16.encode(ext.msg)}"
         )
-        Candidate(candidate, ext, prioritizedTransactions, upcomingContext.currentParameters) -> eliminate
+        Candidate(candidate, ext, prioritizedTransactions, upcomingContext.currentParameters, consideredUncles) -> eliminate
       }
 
       val txs = previousOrderingBlockTransactions ++ orderingTxs
@@ -866,8 +928,8 @@ object CandidateGenerator extends ScorexLogging {
           // state and retry once before falling back to an emission-only candidate.
           val retryCollected = Try(collectTxs(
             minerPk,
-            state.stateContext.currentParameters.maxBlockCost - safeGap,
-            state.stateContext.currentParameters.maxBlockSize,
+            collectCostLimit,
+            collectSizeLimit,
             state,
             upcomingContext,
             newTransactionCandidates,
@@ -891,10 +953,11 @@ object CandidateGenerator extends ScorexLogging {
               val retryInputBlockTransactions = retryPreInputBlockTransactions.filterNot(tx => previousOrderingBlockTransactionIds.contains(tx.id))
               val retryInputBlockTxsDigest = Algos.merkleTreeRoot(retryInputBlockTransactions.map(tx => LeafData @@ tx.serializedId))
               val retryExtensionCandidate = preExtensionCandidate ++
-                InputBlockFields.toExtensionFields(parentInputBlockIdOpt, retryInputBlockTxsDigest, retryInputBlockTxsDigest)
+                InputBlockFields.toExtensionFields(parentInputBlockIdOpt, retryInputBlockTxsDigest, retryInputBlockTxsDigest, uncleField)
               retryExtensionCandidate.proofForInputBlockData match {
                 case Some(retryInputBlockFieldsProof) =>
-                  val retryInputBlockFields = new InputBlockFields(parentInputBlockIdOpt, retryInputBlockTxsDigest, previousInputBlocksTransactionsDigest, retryInputBlockFieldsProof)
+                  val retryInputBlockFields = new InputBlockFields(parentInputBlockIdOpt, retryInputBlockTxsDigest,
+                    previousInputBlocksTransactionsDigest, retryInputBlockFieldsProof, uncleField)
                   Success(mkCandidate(retryTxs, adProof, adDigest, retryEliminate,
                     retryExtensionCandidate, retryInputBlockFields, retryInputBlockTransactions, retryOrderingTxs))
                 case None =>
@@ -1337,6 +1400,79 @@ object CandidateGenerator extends ScorexLogging {
     res
   }
 
+  /**
+    * Selects uncles for an input block candidate: up to InputBlockUncles.MaxUncles candidates, taken in the order
+    * given (oldest first), whose deduplicated transactions have no input-spend conflict with the transactions
+    * collected before them, are valid after them and keep the collected cost and size within the limits.
+    * A candidate which does not fit is skipped, not referenced.
+    *
+    * @param candidates - uncle candidates with their transactions
+    * @param prefix     - collected transactions of the best input block (L of the tip)
+    * @param prefixCost - cost of `prefix`
+    * @param costLimit  - limit for the collected cost (maxBlockCost minus room for the reward transactions)
+    * @param sizeLimit  - limit for the collected size, in bytes
+    * @param validate   - validation of transactions after a collected prefix, returning their cost
+    * @return selected uncle ids, and their deduplicated transactions in collected order
+    */
+  def selectUncles(candidates: Seq[(ModifierId, Seq[ErgoTransaction])],
+                   prefix: Seq[ErgoTransaction],
+                   prefixCost: Long,
+                   costLimit: Long,
+                   sizeLimit: Long,
+                   validate: (Seq[ErgoTransaction], Seq[ErgoTransaction]) => Try[Long]): (Seq[ModifierId], Seq[ErgoTransaction]) = {
+    val selected = MutableArray.empty[ModifierId]
+    val collected = MutableArray[ErgoTransaction](prefix: _*)
+    val collectedIds = scala.collection.mutable.HashSet[ModifierId](prefix.map(_.id): _*)
+    val spent = scala.collection.mutable.HashSet[ModifierId](prefix.flatMap(_.inputs.map(i => bytesToId(i.boxId))): _*)
+    var cost = prefixCost
+    var size = prefix.map(_.size.toLong).sum
+    candidates.foreach { case (id, txs) =>
+      if (selected.length < InputBlockUncles.MaxUncles) {
+        val fresh = txs.filterNot(tx => collectedIds.contains(tx.id))
+        val freshInputs = fresh.flatMap(_.inputs.map(i => bytesToId(i.boxId)))
+        if (freshInputs.distinct.length != freshInputs.length || freshInputs.exists(b => spent.contains(b))) {
+          log.debug(s"Sibling $id conflicts with the collected transactions, not merged")
+        } else {
+          validate(fresh, collected.toVector) match {
+            case Success(uncleCost) =>
+              val uncleSize = fresh.map(_.size.toLong).sum
+              if (cost + uncleCost <= costLimit && size + uncleSize <= sizeLimit) {
+                selected += id
+                collected ++= fresh
+                collectedIds ++= fresh.map(_.id)
+                spent ++= freshInputs
+                cost += uncleCost
+                size += uncleSize
+              } else {
+                log.debug(s"Sibling $id does not fit the collected cost or size limits, not merged")
+              }
+            case Failure(e) =>
+              log.debug(s"Sibling $id is not valid after the collected transactions, not merged: ${e.getMessage}")
+          }
+        }
+      }
+    }
+    (selected.toList, collected.drop(prefix.length).toList)
+  }
+
+  /**
+    * Finds the candidate an input-block solution was mined on, among `candidates` (newest first).
+    *
+    * @param powValid - input-block PoW check of a header, under the candidate's parameters
+    * @return the candidate, and the input block completed from it with the solution
+    */
+  def inputSolutionCandidate(candidates: Seq[Candidate],
+                             solution: AutolykosSolution,
+                             powValid: (Header, Parameters) => Boolean
+                            ): Option[(Candidate, InputBlockAnnouncement, InputBlockTransactionsData)] = {
+    candidates.iterator
+      .map { c =>
+        val (sbi, sbt) = completeInputBlock(c.candidateBlock, solution)
+        (c, sbi, sbt)
+      }
+      .find { case (c, sbi, _) => powValid(sbi.header, c.parameters) }
+  }
+
   /** Checks that transaction "tx" is not spending outputs spent already by transactions "txs" */
   def doublespend(txs: Seq[ErgoTransaction], tx: ErgoTransaction): Boolean = {
     val txsInputs = txs.flatMap(_.inputs.map(_.boxId))
@@ -1394,11 +1530,20 @@ object CandidateGenerator extends ScorexLogging {
     val prevTransactionsDigest: Digest32 = candidate.inputBlockFields.prevTransactionsDigest
     val merkleProof: BatchMerkleProof[Digest32] = candidate.inputBlockFields.inputBlockFieldsProof
 
-    val ibf = new InputBlockFields(prevInputBlockId, inputBlockTransactionsDigest, prevTransactionsDigest, merkleProof)
+    val uncleIdsOpt: Option[Seq[Array[Byte]]] = candidate.inputBlockFields.uncleIds
+
+    val ibf = new InputBlockFields(prevInputBlockId, inputBlockTransactionsDigest, prevTransactionsDigest, merkleProof, uncleIdsOpt)
 
     val weakIds = txs.map(_.weakId)
 
-    val sbi: InputBlockAnnouncement = InputBlockAnnouncement(InputBlockAnnouncement.initialMessageVersion, header, ibf, Some(weakIds))
+    // with uncles enabled, the announcement repeats the uncle ids (version 2), see InputBlockUncles
+    val sbi: InputBlockAnnouncement = uncleIdsOpt match {
+      case Some(uncleIds) =>
+        InputBlockAnnouncement(InputBlockUncles.UnclesMessageVersion, header, ibf, Some(weakIds),
+          InputBlockUncles.announcementBytes(uncleIds.map(bytesToId)))
+      case None =>
+        InputBlockAnnouncement(InputBlockAnnouncement.initialMessageVersion, header, ibf, Some(weakIds))
+    }
     val sbt : InputBlockTransactionsData = InputBlockTransactionsData(sbi.header.id, txs)
 
     (sbi, sbt)
