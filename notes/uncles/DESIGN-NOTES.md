@@ -274,3 +274,37 @@ sbt "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockPro
   - `InputBlockUnclesTestHelpers` (shared fixtures)
   - the four new specs listed above
   - `HistoryTestHelpers.generateHistory(inputBlockUncles)`
+
+## Round 2: the reconstruction finding
+
+The failure at `ErgoNodeViewHolderUnclesSpec.scala:136` came from the **test**, not the reconstruction.
+- **What the test got wrong:** `ProcessOrderingBlock` first appends the ordering block's header (`pmodModify`).
+  With nothing applicable yet, `pmodModify` calls `requestDownloads(progressInfo)`, which publishes a
+  `DownloadRequest` for the header's missing sections, block transactions included. This happens before the
+  reconstruction and whatever it decides. The test failed on the first `DownloadRequest` carrying the block
+  transactions id, which was that one.
+- **What it checked, against items (a)-(d):** the check just before it, run from the test thread on the
+  receiving node's history, already passed. That check calls the receiver's own function
+  (`orderingBlockCollectedTransactions`) and got A, B, S in order. So, on the receiving side:
+  - (a) the order is L(B) ++ deduplicated S ++ own;
+  - (b) it is taken from the tree of the ordering block's parent;
+  - (c) S's transactions are pulled in on the receiving side;
+  - (d) with the flag on, the base's own-then-collected order is not used on this path.
+
+The base's "Merkle root does not match" message is only logged on the flag-off path. The flag-off control test
+runs the same fixture, so those log lines are most likely from that test.
+
+Changes:
+- `InputBlocksProcessor.collectedTransactionsFor(orderingParentId, prevInputBlockId, uncles)` is the one function
+  for "L of the linked input block plus deduplicated uncles". `orderingBlockCollectedTransactions` (receiver) and
+  `CandidateGenerator.createCandidate` (producer, flag on) both use it. The generator falls back to the previous
+  computation only if it returns None. It logs the producer's collected ids at debug level.
+- `InputBlocksProcessor.rebuildOrderingBlockTransactions(header, fields, own)` rebuilds the transactions and checks
+  the root. The node view holder uses it with the flag on. On a mismatch its message lists both the rebuilt
+  collected and own ids, the computed root and the header's root, and the view holder logs that message before
+  falling back to the download. The flag-off path is unchanged.
+- The view-holder spec now asserts `rebuildOrderingBlockTransactions(...) == Right(A, B, S)` on the receiving node
+  before sending the ordering block. After sending, it waits for the block transactions to be applied, since
+  nothing else supplies them in the test, instead of failing on the first download request. The flag-off control
+  also asserts that they are not applied. `InputBlockUnclesSpecification` covers the rebuild function, both match
+  and mismatch.

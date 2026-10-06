@@ -804,7 +804,18 @@ object CandidateGenerator extends ScorexLogging {
       }
       // uncles field of the extension: present (possibly empty) iff uncles are enabled
       val uncleField: Option[Seq[Array[Byte]]] = if (unclesEnabled) Some(uncleIds.map(idToBytes)) else None
-      val previousOrderingBlockTransactions = bestCollectedTransactions ++ uncleTransactions
+      // with uncles enabled, built by the same history function that rebuilds a received ordering block
+      val previousOrderingBlockTransactions = if (unclesEnabled) {
+        bestHeaderOpt
+          .flatMap(h => history.collectedTransactionsFor(h.id, bestInputBlock.map(_.id), uncleIds))
+          .getOrElse(bestCollectedTransactions ++ uncleTransactions)
+      } else {
+        bestCollectedTransactions
+      }
+      if (unclesEnabled) {
+        log.debug(s"Candidate collected transactions (linked input block ${bestInputBlock.map(_.id)}, uncles $uncleIds): " +
+          previousOrderingBlockTransactions.map(_.id).mkString(", "))
+      }
       val previousOrderingBlockTransactionIds = previousOrderingBlockTransactions.map(_.id)
 
       // with uncles enabled, collected transactions of an input block must leave room for reward transactions

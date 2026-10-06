@@ -471,30 +471,38 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         // todo: download only txs which are not in the mempool if allTransactionsDownloaded == false,
         // todo: currently the whole block is downloaded
 
-        // With input-block uncles enabled, the input-block part is L of the input block the ordering block links,
-        // in the input block tree of its parent, with the uncles it references; it comes first, as in the
-        // generator's candidate. None (an input block or transaction missing) falls back to a full download.
-        val collectedOpt = if (settings.nodeSettings.inputBlockUncles) {
-          history().orderingBlockCollectedTransactions(parentId, oba.extensionFields)
-        } else {
-          Some(Seq.empty)
-        }
-
-        if (allTransactionsDownloaded && collectedOpt.isDefined) {
+        // With input-block uncles enabled, the transactions are rebuilt by the history (the function shared with the
+        // generator): L of the input block the ordering block links, in the input block tree of its parent, with
+        // the uncles it references, then its own transactions; checked against the transactions root. Anything
+        // missing or a root mismatch falls back to a full download.
+        if (settings.nodeSettings.inputBlockUncles) {
+          val orderingBlockTransactions = oba.nonBroadcastedTransactions ++ mempoolTransactions
+          val rebuilt = if (allTransactionsDownloaded) {
+            history().rebuildOrderingBlockTransactions(header, oba.extensionFields, orderingBlockTransactions)
+          } else {
+            Left(s"not all the broadcasted transactions of $headerId are in the mempool")
+          }
+          rebuilt match {
+            case Right(txs) =>
+              history().saveOrderingBlockTransactions(headerId, orderingBlockTransactions)
+              log.info(s"Applying block transactions rebuilt from input-blocks for $headerId with transactions: " +
+                s"${txs.length} [${txs.map(_.id).mkString(", ")}]")
+              pmodModify(new BlockTransactions(headerId, header.version, txs), local = false)
+              context.system.eventStream.publish(NewBestInputBlock(None, local = false))
+            case Left(reason) =>
+              log.warn(s"Downloading block transactions fully for $headerId: $reason")
+              context.system.eventStream.publish(DownloadRequest(Map(BlockTransactions.modifierTypeId -> Seq(header.transactionsId))))
+          }
+        } else if (allTransactionsDownloaded) {
           val orderingBlockTransactions = oba.nonBroadcastedTransactions ++ mempoolTransactions
           history().saveOrderingBlockTransactions(headerId, orderingBlockTransactions)
+          val inputBlocksTransactions = history().getCollectedInputBlocksTransactions(headerId).getOrElse(Seq.empty)
 
-          val txs = if (settings.nodeSettings.inputBlockUncles) {
-            collectedOpt.getOrElse(Seq.empty) ++ orderingBlockTransactions
-          } else {
-            val collectedInputTxs = history().getCollectedInputBlocksTransactions(headerId).getOrElse(Seq.empty)
-            // todo: check if ordering block transactions should come first
-            orderingBlockTransactions ++ collectedInputTxs
-          }
-          val inputBlocksTransactionsCount = txs.length - orderingBlockTransactions.length
+          // todo: check if ordering block transactions should come first
+          val txs = orderingBlockTransactions ++ inputBlocksTransactions
 
           log.debug(s"For ordering block ${header}, applying ${orderingBlockTransactions.length} ordering-block " +
-            s"transactions and ${inputBlocksTransactionsCount} input-blocks transactions, " +
+            s"transactions and ${inputBlocksTransactions.length} input-blocks transactions, " +
             s"total transactions: ${txs.length} ")
 
           val calculatedDigest = BlockTransactions.transactionsRoot(txs, header.version)
@@ -516,7 +524,6 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
           }
         } else {
           log.warn(s"Downloading block transactions fully for $headerId as not all the transactions available")
-          // (or, with input-block uncles enabled, not all input blocks or their transactions)
           context.system.eventStream.publish(DownloadRequest(Map(BlockTransactions.modifierTypeId -> Seq(header.transactionsId))))
         }
 

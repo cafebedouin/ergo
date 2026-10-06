@@ -117,8 +117,11 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
         Extension.InputBlockUnclesKey -> InputBlockUncles.fieldValue(Seq(idToBytes(s.id))))
       val header = nextBlock.header.copy(extensionRoot = ExtensionCandidate(fields).digest)
       if (uncles) {
-        getHistory.orderingBlockCollectedTransactions(genesis.id, fields).map(_.map(_.id)) shouldBe
-          Some(Seq(aTx, bTx, sTx).map(_.id))
+        // the receiver's rebuild (the function the node view holder uses), checked against the header's root;
+        // on a mismatch its Left message lists the rebuilt ids
+        val expectedIds = Seq(aTx, bTx, sTx).map(_.id)
+        getHistory.orderingBlockCollectedTransactions(genesis.id, fields).map(_.map(_.id)) shouldBe Some(expectedIds)
+        getHistory.rebuildOrderingBlockTransactions(header, fields, Seq.empty).map(_.map(_.id)) shouldBe Right(expectedIds)
       }
       val oba = OrderingBlockAnnouncement(OrderingBlockAnnouncement.CurrentVersion, header, Seq.empty, Seq.empty, fields)
 
@@ -129,23 +132,28 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
     }
   }
 
+  // Appending the ordering block's header makes the node request its missing sections (a DownloadRequest for the
+  // block transactions among them) whatever the reconstruction does, so download requests do not tell the outcome.
+  // The block transactions are applied only if they were rebuilt: nothing else supplies them in these tests.
+
   property("ordering block transactions rebuilt from L and uncles, not downloaded") {
     orderingBlockOverInputBlocks(uncles = true) { (fixture, oba) =>
       fixture.testProbe.fishForMessage(10.seconds) {
-        case DownloadRequest(toFetch) if toFetch.contains(BlockTransactions.modifierTypeId) =>
-          fail("block transactions downloaded instead of rebuilt from input blocks")
         case SyntacticallySuccessfulModifier(_, id) => id == oba.header.transactionsId
         case _ => false
       }
     }
   }
 
-  property("uncles disabled: ordering block transactions are downloaded as before") {
+  property("uncles disabled: ordering block transactions are not rebuilt, they are downloaded as before") {
     orderingBlockOverInputBlocks(uncles = false) { (fixture, oba) =>
-      fixture.testProbe.fishForMessage(10.seconds) {
+      import fixture._
+      testProbe.fishForMessage(10.seconds) {
         case DownloadRequest(toFetch) => toFetch.get(BlockTransactions.modifierTypeId).contains(Seq(oba.header.transactionsId))
         case _ => false
       }
+      Thread.sleep(1000)
+      getHistory.contains(oba.header.transactionsId) shouldBe false
     }
   }
 

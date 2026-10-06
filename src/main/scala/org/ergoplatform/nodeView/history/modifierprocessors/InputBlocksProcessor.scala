@@ -1,6 +1,7 @@
 package org.ergoplatform.nodeView.history.modifierprocessors
 
 import com.google.common.cache.CacheBuilder
+import org.ergoplatform.modifiers.history.BlockTransactions
 import org.ergoplatform.modifiers.history.extension.Extension
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
@@ -1593,6 +1594,24 @@ trait InputBlocksProcessor extends ScorexLogging {
   }
 
   /**
+    * Collected transactions an ordering block or input block candidate built on input block `prevInputBlockId`
+    * (of the ordering block `orderingParentId`) and merging `uncles` commits to before its own transactions:
+    * L(prevInputBlockId) followed by the deduplicated transactions of the uncles. Shared by the producer
+    * (CandidateGenerator) and the receiver (ordering block reconstruction).
+    *
+    * @return None if some input block or transaction is not available
+    */
+  def collectedTransactionsFor(orderingParentId: ModifierId,
+                               prevInputBlockId: Option[ModifierId],
+                               uncles: Seq[ModifierId]): Option[Seq[ErgoTransaction]] = {
+    for {
+      path <- prevInputBlockId.map(inputBlockPath(orderingParentId, _)).getOrElse(Some(Seq.empty))
+      collected <- collectTransactions(path, strict = true)
+      merged <- mergeUncleTransactions(collected, uncles)
+    } yield merged
+  }
+
+  /**
     * Rebuilds the input-block part of an ordering block's transactions from its extension: L of the input block
     * it links (key 0x03 0x02), in the input block tree of its parent `orderingParentId`, followed by the
     * deduplicated transactions of the uncles it references (key 0x03 0x03). The ordering block's own
@@ -1607,12 +1626,36 @@ trait InputBlocksProcessor extends ScorexLogging {
       case Some(kv) => InputBlockUncles.parseFieldValue(kv._2)
       case None => Some(Seq.empty)
     }
-    for {
-      uncles <- unclesOpt
-      path <- prevOpt.map(inputBlockPath(orderingParentId, _)).getOrElse(Some(Seq.empty))
-      collected <- collectTransactions(path, strict = true)
-      merged <- mergeUncleTransactions(collected, uncles)
-    } yield merged
+    unclesOpt.flatMap(uncles => collectedTransactionsFor(orderingParentId, prevOpt, uncles))
+  }
+
+  /**
+    * Rebuilds an ordering block's transactions: `orderingBlockCollectedTransactions` (in the tree of the header's
+    * parent) followed by `ownTransactions`, checked against the header's transactions root.
+    *
+    * @return the transactions, or why they could not be rebuilt (with the rebuilt ids on a root mismatch)
+    */
+  def rebuildOrderingBlockTransactions(header: Header,
+                                       extensionFields: Seq[(Array[Byte], Array[Byte])],
+                                       ownTransactions: Seq[ErgoTransaction]): Either[String, Seq[ErgoTransaction]] = {
+    orderingBlockCollectedTransactions(header.parentId, extensionFields) match {
+      case None =>
+        Left(s"input blocks or transactions linked by ordering block ${header.id} are not available")
+      case Some(collected) =>
+        val txs = collected ++ ownTransactions
+        val root = BlockTransactions.transactionsRoot(txs, header.version)
+        if (root.sameElements(header.transactionsRoot)) {
+          Right(txs)
+        } else {
+          val linked = extensionFields.find(_._1.sameElements(Extension.PrevInputBlockIdKey)).map(kv => bytesToId(kv._2))
+          val uncles = InputBlockUncles.fromExtensionFields(extensionFields).getOrElse(Seq.empty)
+          Left(s"Merkle root of rebuilt transactions does not match ordering block ${header.id} " +
+            s"(version ${header.version}, parent ${header.parentId}, linked input block $linked, uncles $uncles): " +
+            s"rebuilt ${collected.length} collected [${collected.map(_.id).mkString(", ")}] and ${ownTransactions.length} " +
+            s"own [${ownTransactions.map(_.id).mkString(", ")}], root ${Algos.encode(root)}, " +
+            s"header root ${Algos.encode(header.transactionsRoot)}")
+        }
+    }
   }
 
 }

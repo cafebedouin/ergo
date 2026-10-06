@@ -225,6 +225,16 @@ class InputBlockUnclesSpecification extends ErgoCorePropertyTest with InputBlock
     BlockTransactions.transactionsRoot(rebuilt, Header.Interpreter60Version) shouldBe
       BlockTransactions.transactionsRoot(expected, Header.Interpreter60Version)
 
+    // the rebuild checked against an ordering block header committing to the expected transactions
+    val orderingHeader = freshInputBlockHeader(h, us).copy(version = Header.InitialVersion,
+      transactionsRoot = BlockTransactions.transactionsRoot(expected, Header.InitialVersion))
+    orderingHeader.parentId shouldBe orderingParentId
+    h.rebuildOrderingBlockTransactions(orderingHeader, extFields, own).map(_.map(_.id)) shouldBe Right(expected.map(_.id))
+    // own transactions missing: the root does not match, and the message lists the rebuilt ids
+    val mismatch = h.rebuildOrderingBlockTransactions(orderingHeader, extFields, Seq.empty)
+    mismatch.isLeft shouldBe true
+    mismatch.fold(reason => reason, _ => "") should include(spend(boxes(3)).id)
+
     // an ordering block linking B and merging S itself
     val extFieldsB = Seq(Extension.PrevInputBlockIdKey -> idToBytes(b.id),
       Extension.InputBlockUnclesKey -> InputBlockUncles.fieldValue(Seq(idToBytes(s.id))))
