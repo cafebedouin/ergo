@@ -275,8 +275,13 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
 
   protected def txModify(unconfirmedTx: UnconfirmedTransaction): ProcessingOutcome = {
     val tx = unconfirmedTx.transaction
-    val inputBlockTransactions = history().bestInputBlocksChain().flatMap { id =>
-      history().getInputBlockTransactions(id).getOrElse(Seq.empty)
+    val inputBlockTransactions = if (settings.nodeSettings.inputBlockUncles) {
+      // collected transactions of the best input block chain, including the ones merged from uncles
+      history().getBestOrderingCollectedInputBlocksTransactions()
+    } else {
+      history().bestInputBlocksChain().flatMap { id =>
+        history().getInputBlockTransactions(id).getOrElse(Seq.empty)
+      }
     }
     val (newPool, processingOutcome) = memoryPool().process(unconfirmedTx, minimalState(), inputBlockTransactions)
     processingOutcome match {
@@ -356,6 +361,14 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         context.system.eventStream.publish(DownloadInputBlock(inputId, remote))
       }
 
+      // ask for uncles the input block merges which are not known yet (input-block uncles enabled only)
+      if (history().getInputBlock(inputBlockInfo.id).isDefined) {
+        history().missingUncles(inputBlockInfo).foreach { uncleId =>
+          log.debug(s"Don't have uncle $uncleId of input-block ${inputBlockInfo.id}, asking it")
+          context.system.eventStream.publish(DownloadInputBlock(uncleId, remote))
+        }
+      }
+
       history().getInputBlockTransactions(inputBlockInfo.id) match {
         case Some(txs) =>
           // we already have transactions, that is possible sometimes if they arrive before the input block
@@ -389,6 +402,10 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         history().applyInputBlockTransactions(inputBlockId, transactions, minimalState())
       }
 
+      // transactions an input block merged from its uncles (input-block uncles enabled only)
+      def uncleTransactions(id: ModifierId): Seq[ErgoTransaction] =
+        history().getInputBlockUncles(id).flatMap(u => history().getInputBlockTransactions(u).getOrElse(Seq.empty))
+
       rollbackInputBlocks.foreach { id =>
         history().getInputBlockTransactions(id) match {
           case Some(txs) =>
@@ -398,6 +415,10 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
             val newVault = vault().rollbackInputBlock(id)
             updateNodeView(updatedVault = Some(newVault))
           case None =>
+        }
+        val mergedTxs = uncleTransactions(id)
+        if (mergedTxs.nonEmpty) {
+          updateNodeView(updatedMempool = Some(memoryPool().put(mergedTxs.map(tx => UnconfirmedTransaction(tx, None)))))
         }
       }
 
@@ -411,6 +432,10 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
             val newVault = vault().scanInputBlock(id)
             updateNodeView(updatedVault = Some(newVault))
           case None =>
+        }
+        val mergedTxs = uncleTransactions(id)
+        if (mergedTxs.nonEmpty) {
+          updateNodeView(updatedMempool = Some(memoryPool().removeWithDoubleSpends(mergedTxs)))
         }
       }
 
@@ -446,16 +471,30 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         // todo: download only txs which are not in the mempool if allTransactionsDownloaded == false,
         // todo: currently the whole block is downloaded
 
-        if (allTransactionsDownloaded) {
+        // With input-block uncles enabled, the input-block part is L of the input block the ordering block links,
+        // in the input block tree of its parent, with the uncles it references; it comes first, as in the
+        // generator's candidate. None (an input block or transaction missing) falls back to a full download.
+        val collectedOpt = if (settings.nodeSettings.inputBlockUncles) {
+          history().orderingBlockCollectedTransactions(parentId, oba.extensionFields)
+        } else {
+          Some(Seq.empty)
+        }
+
+        if (allTransactionsDownloaded && collectedOpt.isDefined) {
           val orderingBlockTransactions = oba.nonBroadcastedTransactions ++ mempoolTransactions
           history().saveOrderingBlockTransactions(headerId, orderingBlockTransactions)
-          val inputBlocksTransactions = history().getCollectedInputBlocksTransactions(headerId).getOrElse(Seq.empty)
 
-          // todo: check if ordering block transactions should come first
-          val txs = orderingBlockTransactions ++ inputBlocksTransactions
+          val txs = if (settings.nodeSettings.inputBlockUncles) {
+            collectedOpt.getOrElse(Seq.empty) ++ orderingBlockTransactions
+          } else {
+            val collectedInputTxs = history().getCollectedInputBlocksTransactions(headerId).getOrElse(Seq.empty)
+            // todo: check if ordering block transactions should come first
+            orderingBlockTransactions ++ collectedInputTxs
+          }
+          val inputBlocksTransactionsCount = txs.length - orderingBlockTransactions.length
 
           log.debug(s"For ordering block ${header}, applying ${orderingBlockTransactions.length} ordering-block " +
-            s"transactions and ${inputBlocksTransactions.length} input-blocks transactions, " +
+            s"transactions and ${inputBlocksTransactionsCount} input-blocks transactions, " +
             s"total transactions: ${txs.length} ")
 
           val calculatedDigest = BlockTransactions.transactionsRoot(txs, header.version)
@@ -477,6 +516,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
           }
         } else {
           log.warn(s"Downloading block transactions fully for $headerId as not all the transactions available")
+          // (or, with input-block uncles enabled, not all input blocks or their transactions)
           context.system.eventStream.publish(DownloadRequest(Map(BlockTransactions.modifierTypeId -> Seq(header.transactionsId))))
         }
 
