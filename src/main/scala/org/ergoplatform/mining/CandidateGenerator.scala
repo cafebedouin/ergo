@@ -201,7 +201,8 @@ class CandidateGenerator(
     case gen @ GenerateCandidate(txsToInclude, reply, forced, optPk) =>
       val senderOpt = if (reply) Some(sender()) else None
       val effectiveMinerPk = optPk.getOrElse(minerPk)
-      val selectedInputBlockId = state.hr.bestBlocks._2.map(_.id)
+      // the input block a new candidate builds on (with uncles enabled, the processed tip of the best chain)
+      val selectedInputBlockId = state.hr.candidateParentInputBlock().map(_.id)
       lazy val selectedInputTransactionsDigest = Algos.merkleTreeRoot(
         state.hr.getBestOrderingCollectedInputBlocksTransactions().map(tx => LeafData @@ tx.serializedId))
       // siblings which could be merged as uncles: a new one (e.g. validated after the candidate was built) makes
@@ -681,7 +682,10 @@ object CandidateGenerator extends ScorexLogging {
       val stateContext = state.stateContext
 
       // Extract best header and extension of a best block for assembling a new block
-      val (bestHeaderOpt, bestInputBlock) = history.bestBlocks
+      // With uncles enabled the candidate builds on the processed tip of the best chain, the chain its uncles and
+      // collected transactions are judged against (as validation does); otherwise on the best input block.
+      val bestHeaderOpt = history.bestBlocks._1
+      val bestInputBlock = history.candidateParentInputBlock()
       val bestExtensionOpt: Option[Extension] = bestHeaderOpt
         .flatMap(h => history.typedModifierById[Extension](h.extensionId))
 
@@ -807,7 +811,7 @@ object CandidateGenerator extends ScorexLogging {
       // with uncles enabled, built by the same history function that rebuilds a received ordering block
       val previousOrderingBlockTransactions = if (unclesEnabled) {
         bestHeaderOpt
-          .flatMap(h => history.collectedTransactionsFor(h.id, bestInputBlock.map(_.id), uncleIds))
+          .flatMap(h => history.collectedTransactionsFor(h.id, bestInputBlock.map(_.id), uncleIds).toOption)
           .getOrElse(bestCollectedTransactions ++ uncleTransactions)
       } else {
         bestCollectedTransactions
