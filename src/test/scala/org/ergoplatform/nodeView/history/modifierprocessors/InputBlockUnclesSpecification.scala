@@ -6,7 +6,7 @@ import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.subblocks.InputBlockUncles
 import org.ergoplatform.utils.{ErgoCorePropertyTest, InputBlockUnclesTestHelpers}
 import org.ergoplatform.utils.ErgoCoreTestConstants.parameters
-import scorex.util.{bytesToId, idToBytes}
+import scorex.util.{ModifierId, bytesToId, idToBytes}
 
 /**
   * Input-block uncles (node setting `inputBlockUncles`): an input block may merge up to two siblings, i.e. input
@@ -233,7 +233,7 @@ class InputBlockUnclesSpecification extends ErgoCorePropertyTest with InputBlock
     // own transactions missing: the root does not match, and the message lists the rebuilt ids
     val mismatch = h.rebuildOrderingBlockTransactions(orderingHeader, extFields, Seq.empty)
     mismatch.isLeft shouldBe true
-    mismatch.fold(reason => reason, _ => "") should include(spend(boxes(3)).id)
+    mismatch.fold(_.reason, _ => "") should include(spend(boxes(3)).id)
 
     // an ordering block linking B and merging S itself
     val extFieldsB = Seq(Extension.PrevInputBlockIdKey -> idToBytes(b.id),
@@ -248,6 +248,38 @@ class InputBlockUnclesSpecification extends ErgoCorePropertyTest with InputBlock
       Seq(Extension.PrevInputBlockIdKey -> idToBytes(c.id), Extension.InputBlockUnclesKey -> unknown)) shouldBe None
     // another ordering block's tree: not rebuilt
     h.orderingBlockCollectedTransactions(c.id, extFields) shouldBe None
+  }
+
+  property("each reason for collected transactions not being available names what is missing") {
+    val (h, us) = setup()
+    val (a, b, s) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    val orderingParentId = h.bestFullBlockOpt.get.id
+    def reason(prev: Option[ModifierId], uncles: Seq[ModifierId]): String =
+      h.collectedTransactionsFor(orderingParentId, prev, uncles).fold(r => r, _ => "")
+
+    // the linked input block is unknown
+    val unknown = bytesToId(Array.fill(32)(4.toByte))
+    reason(Some(unknown), Seq.empty) should include(s"linked input block $unknown is not known")
+    reason(Some(unknown), Seq.empty) should include(s"input block tree of $orderingParentId")
+
+    // an element of the path is unknown (D's parent)
+    val d = announce(h, us, Some(unknown), Seq.empty)
+    h.applyInputBlock(d) shouldBe Some(unknown)
+    reason(Some(d.id), Seq.empty) should include(s"path element $unknown (on the path to ${d.id}) is not known")
+
+    // an element of the path has no transaction list (E only announced)
+    val e = announce(h, us, Some(b.id), Seq(spend(boxes(3))))
+    h.applyInputBlock(e) shouldBe None
+    reason(Some(e.id), Seq.empty) should include(s"transaction id list of path element ${e.id} is not stored")
+
+    // an uncle of the ordering block has no transaction list (U only announced), or is unknown
+    val u = announce(h, us, Some(a.id), Seq(spend(boxes(4))))
+    h.applyInputBlock(u) shouldBe None
+    reason(Some(b.id), Seq(u.id)) should include(s"transaction list of uncle ${u.id} is not available (uncle record known: true")
+    reason(Some(b.id), Seq(unknown)) should include(s"transaction list of uncle $unknown is not available (uncle record known: false")
+
+    h.collectedTransactionsFor(orderingParentId, Some(b.id), Seq(s.id)).map(_.map(_.id)) shouldBe
+      Right(Seq(boxes(0), boxes(1), boxes(2)).map(bx => spend(bx).id))
   }
 
 }

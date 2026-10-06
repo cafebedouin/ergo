@@ -7,6 +7,7 @@ import org.ergoplatform.modifiers.history.extension.{Extension, ExtensionCandida
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages._
 import org.ergoplatform.network.message.inputblocks.{InputBlockTransactionsData, OrderingBlockAnnouncement}
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.{DownloadInputBlock, DownloadRequest}
+import org.ergoplatform.nodeView.LocallyGeneratedInputBlock
 import org.ergoplatform.nodeView.state.{ErgoState, StateType}
 import org.ergoplatform.nodeView.state.wrapped.WrappedUtxoState
 import org.ergoplatform.settings.Constants.TrueTree
@@ -154,6 +155,116 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
       }
       Thread.sleep(1000)
       getHistory.contains(oba.header.transactionsId) shouldBe false
+    }
+  }
+
+  /**
+    * After the genesis block, transactions for input blocks of the next ordering block: `aTx` splits an
+    * anyone-can-spend genesis output, `tx1` and `tx2` spend its halves.
+    */
+  private def genesisWithTransactions(fixture: NodeViewFixture) = {
+    import fixture._
+    val (us, bh) = createUtxoState(fixture.settings)
+    val genesis = validFullBlock(parentOpt = None, us, bh)
+    applyBlock(genesis).isSuccess shouldBe true
+    val wus = WrappedUtxoState(us, bh, fixture.settings).applyModifier(genesis)(_ => ()).get
+    val box = ErgoState.newBoxes(genesis.transactions).filter(_.ergoTree == TrueTree).maxBy(_.value)
+    val aTx = split(box)
+    (genesis, wus, aTx, spend(aTx.outputs(0)), spend(aTx.outputs(1)))
+  }
+
+  /** Ordering block after `genesis` with the transactions given, linking `linked` and merging `uncles`. */
+  private def orderingBlock(genesis: org.ergoplatform.modifiers.ErgoFullBlock,
+                            wus: WrappedUtxoState,
+                            txs: Seq[org.ergoplatform.modifiers.mempool.ErgoTransaction],
+                            linked: scorex.util.ModifierId,
+                            uncles: Seq[scorex.util.ModifierId]): OrderingBlockAnnouncement = {
+    val block = validFullBlock(Some(genesis), wus, txs)
+    val fields = block.extension.fields ++ Seq(
+      Extension.PrevInputBlockIdKey -> idToBytes(linked),
+      Extension.InputBlockUnclesKey -> InputBlockUncles.fieldValue(uncles.map(idToBytes)))
+    val header = block.header.copy(extensionRoot = ExtensionCandidate(fields).digest)
+    OrderingBlockAnnouncement(OrderingBlockAnnouncement.CurrentVersion, header, Seq.empty, Seq.empty, fields)
+  }
+
+  /**
+    * (i) The receiving node mined the linked input block X itself moments earlier. The ordering block (mined by
+    * another node) also merges an uncle S, a sibling of X which reaches the receiver only right after the
+    * ordering block. Before the fix the rebuild was tried once, found S missing ("not available") and the block
+    * transactions were downloaded; now the ordering block waits for S and is rebuilt.
+    */
+  property("ordering block linking an input block mined locally moments earlier, uncle arriving right after") {
+    new NodeViewFixture(nodeSettings(uncles = true), parameters).apply { fixture =>
+      import fixture._
+      val (genesis, wus, aTx, xTx, sTx) = genesisWithTransactions(fixture)
+      val a = announceOn(validFullBlock(Some(genesis), wus).header, None, Seq(aTx))
+      val x = announceOn(validFullBlock(Some(genesis), wus).header, Some(a.id), Seq(xTx))
+      val s = announceOn(validFullBlock(Some(genesis), wus).header, Some(a.id), Seq(sTx))
+
+      nodeViewHolderRef ! ProcessInputBlock(a, peer(fixture))
+      nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(a.id, Seq(aTx)))
+      // X is mined by this node
+      nodeViewHolderRef ! LocallyGeneratedInputBlock(x, InputBlockTransactionsData(x.id, Seq(xTx)))
+      awaitCondition(10.seconds)(getHistory.bestInputBlocksChain() == Seq(x.id, a.id)) shouldBe true
+
+      val oba = orderingBlock(genesis, wus, Seq(aTx, xTx, sTx), x.id, Seq(s.id))
+      // S is unknown here yet: the rebuild says why
+      getHistory.rebuildOrderingBlockTransactions(oba.header, oba.extensionFields, Seq.empty)
+        .fold(_.reason, _ => "") should include(s"uncle ${s.id}")
+
+      subscribeEvents(classOf[SyntacticallySuccessfulModifier])
+      nodeViewHolderRef ! ProcessOrderingBlock(oba)
+      // the uncle right after the ordering block
+      nodeViewHolderRef ! ProcessInputBlock(s, peer(fixture))
+      nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(s.id, Seq(sTx)))
+
+      testProbe.fishForMessage(10.seconds) {
+        case SyntacticallySuccessfulModifier(_, id) => id == oba.header.transactionsId
+        case _ => false
+      }
+    }
+  }
+
+  /**
+    * (ii) The ordering block links C, a chain element merging uncle S. It arrives right after S's announcement
+    * was applied, while S's transactions (and so C's processing) come right after it. Before the fix the rebuild
+    * found S's transaction list missing and downloaded the block transactions; now it waits and is rebuilt. S,
+    * a valid sibling, is also relayed (NewInputBlockSibling), so peers have it before blocks merging it.
+    */
+  property("ordering block whose chain element merges an uncle, received right around the uncle") {
+    new NodeViewFixture(nodeSettings(uncles = true), parameters).apply { fixture =>
+      import fixture._
+      val (genesis, wus, aTx, cTx, sTx) = genesisWithTransactions(fixture)
+      val a = announceOn(validFullBlock(Some(genesis), wus).header, None, Seq(aTx))
+      val s = announceOn(validFullBlock(Some(genesis), wus).header, Some(a.id), Seq(sTx))
+      // C (child of A, so a sibling of S's position) merges S and spends the other half
+      val c = announceOn(validFullBlock(Some(genesis), wus).header, Some(a.id), Seq(cTx), uncles = Seq(s.id))
+
+      nodeViewHolderRef ! ProcessInputBlock(a, peer(fixture))
+      nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(a.id, Seq(aTx)))
+      nodeViewHolderRef ! ProcessInputBlock(c, peer(fixture))
+      nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(c.id, Seq(cTx)))
+      nodeViewHolderRef ! ProcessInputBlock(s, peer(fixture))
+      awaitCondition(10.seconds)(getHistory.getInputBlock(s.id).isDefined) shouldBe true
+      // C waits for its uncle's transactions
+      getHistory.bestInputBlocksChain() shouldBe Seq(a.id)
+
+      val oba = orderingBlock(genesis, wus, Seq(aTx, sTx, cTx), c.id, Seq.empty)
+      subscribeEvents(classOf[SyntacticallySuccessfulModifier])
+      subscribeEvents(classOf[NewInputBlockSibling])
+      nodeViewHolderRef ! ProcessOrderingBlock(oba)
+      nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(s.id, Seq(sTx)))
+
+      var relayed = false
+      testProbe.fishForMessage(10.seconds) {
+        case NewInputBlockSibling(id, _) =>
+          if (id == s.id) relayed = true
+          false
+        case SyntacticallySuccessfulModifier(_, id) => id == oba.header.transactionsId
+        case _ => false
+      }
+      relayed shouldBe true
+      getHistory.getInputBlockValidity(c.id) shouldBe Some(true)
     }
   }
 

@@ -168,4 +168,40 @@ class CandidateGeneratorUnclesSpec extends ErgoCorePropertyTest with InputBlockU
     sbi.uncleIdsOpt shouldBe None
   }
 
+  /**
+    * Generator and validation must judge uncles against the same chain. A, B, C is processed (C merged S1), S2 is
+    * another valid sibling, and E (extending C, merging S2) is only announced: the best fork's unprocessed tail.
+    * Before the fix the generator built on E (the best fork's last element) but judged uncles against the
+    * processed chain A, B, C, so it merged S2 again and its block was invalid once E was processed ("uncle ... is
+    * merged by an earlier element"). Now it builds on C, the processed tip, and the block validates.
+    */
+  property("generator and validation agree on uncles when siblings were merged earlier and the chain has an unprocessed tail") {
+    val (h, us) = setup()
+    val (a, b, s1) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    val c = announce(h, us, Some(b.id), Seq(spend(boxes(3))), uncles = Seq(s1.id))
+    process(h, us, c, Seq(spend(boxes(3)))) shouldBe (Seq(c.id) -> Seq.empty)
+    val s2 = announce(h, us, Some(a.id), Seq(spend(boxes(4))))
+    process(h, us, s2, Seq(spend(boxes(4)))) shouldBe (Seq.empty -> Seq.empty)
+    h.mergeableUncleCandidates() shouldBe Seq(s2.id)
+
+    val eTx = spend(boxes(5))
+    val e = announce(h, us, Some(c.id), Seq(eTx), uncles = Seq(s2.id))
+    h.applyInputBlock(e) shouldBe None
+    h.bestInputBlock().map(_.id) shouldBe Some(e.id)
+    h.candidateParentInputBlock().map(_.id) shouldBe Some(c.id)
+
+    val cand = candidate(h, us, unclesSettings)
+    cand.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) shouldBe Some(c.id)
+    cand.candidateBlock.inputBlockFields.uncleIds.map(_.map(bytesToId)) shouldBe Some(Seq(s2.id))
+    val (sbi, sbt) = CandidateGenerator.completeInputBlock(cand.candidateBlock, solution)
+
+    // E's transactions arrive: E is processed and merges S2
+    h.applyInputBlockTransactions(e.id, Seq(eTx), us)._1 shouldBe Seq(e.id)
+    // the produced block (a sibling of E) validates under the same uncle rule
+    h.applyInputBlock(sbi) shouldBe None
+    h.applyInputBlockTransactions(sbi.id, sbt.transactions, us)
+    h.getInputBlockValidity(sbi.id) shouldBe Some(true)
+    h.getInputBlockValidity(e.id) shouldBe Some(true)
+  }
+
 }
