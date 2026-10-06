@@ -51,7 +51,8 @@ case class NodeConfigurationSettings(override val stateType: StateType,
                                      extraIndex: Boolean,
                                      rejectStorageRentTxs: Boolean = false,
                                      blacklistedTransactions: Seq[String] = Seq.empty,
-                                     checkpoint: Option[CheckpointSettings] = None) extends ClientCapabilities {
+                                     checkpoint: Option[CheckpointSettings] = None,
+                                     inputBlockUncles: Boolean = false) extends ClientCapabilities {
   /**
     * Whether the node keeping all the full blocks of the blockchain or not.
     * @return true if the blockchain is pruned, false if not
@@ -97,7 +98,8 @@ trait NodeConfigurationReaders extends StateTypeReaders with CheckpointingSettin
       cfg.as[Boolean](s"$path.extraIndex"),
       cfg.as[Boolean](s"$path.rejectStorageRentTxs"),
       cfg.as[Seq[String]](s"$path.blacklistedTransactions"),
-      cfg.as[Option[CheckpointSettings]](s"$path.checkpoint")
+      cfg.as[Option[CheckpointSettings]](s"$path.checkpoint"),
+      cfg.as[Option[Boolean]](s"$path.inputBlockUncles").getOrElse(false)
     )
   }
 
