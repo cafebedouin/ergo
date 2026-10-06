@@ -2,11 +2,12 @@ package org.ergoplatform.mining
 
 import io.circe.Encoder
 import io.circe.syntax._
-import org.ergoplatform.modifiers.history.extension.Extension.{InputBlockTransactionsDigestKey, PrevInputBlockIdKey, PreviousInputBlockTransactionsDigestKey}
+import org.ergoplatform.modifiers.history.extension.Extension.{InputBlockTransactionsDigestKey, InputBlockUnclesKey, PrevInputBlockIdKey, PreviousInputBlockTransactionsDigestKey}
 import org.ergoplatform.modifiers.history.extension.ExtensionCandidate
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.settings.Algos
+import org.ergoplatform.subblocks.InputBlockUncles
 import scorex.crypto.authds.merkle.BatchMerkleProof
 import scorex.crypto.authds.{ADDigest, SerializedAdProof}
 import scorex.crypto.hash.Digest32
@@ -19,11 +20,13 @@ import scorex.crypto.hash.Digest32
 * @param inputBlockFieldsProof - batch Merkle proof for `prevSubBlockId`` and `subblockTransactionsDigest`
 *                      (as they are coming from extension section, and committed in `subBlock` header via extension
 *                      digest)
+* @param uncleIds - uncles merged by the input block (extension key 0x03 0x03), None if the field is absent
 */
 class InputBlockFields(val prevInputBlockId: Option[Array[Byte]],
                        val transactionsDigest: Digest32,
                        val prevTransactionsDigest: Digest32,
-                       val inputBlockFieldsProof: BatchMerkleProof[Digest32])
+                       val inputBlockFieldsProof: BatchMerkleProof[Digest32],
+                       val uncleIds: Option[Seq[Array[Byte]]] = None)
 
 object InputBlockFields {
   def empty: InputBlockFields = {
@@ -36,7 +39,8 @@ object InputBlockFields {
 
   def toExtensionFields(prevInputBlockIdOpt: Option[Array[Byte]],
                         transactionsDigest: Digest32,
-                        prevTransactionsDigest: Digest32): ExtensionCandidate = {
+                        prevTransactionsDigest: Digest32,
+                        uncleIdsOpt: Option[Seq[Array[Byte]]] = None): ExtensionCandidate = {
     val prevInput = prevInputBlockIdOpt.map { prevInputBlockId =>
       (PrevInputBlockIdKey, prevInputBlockId)
     }.toSeq
@@ -47,7 +51,10 @@ object InputBlockFields {
     // digest (Merkle tree root) first class transactions since ordering block till last input-block
     val prevTxs = (PreviousInputBlockTransactionsDigestKey, prevTransactionsDigest)
 
-    ExtensionCandidate(prevInput ++ Seq(txs, prevTxs))
+    // uncles merged by the input block, written (possibly empty) only when uncles are enabled
+    val uncles = uncleIdsOpt.map(ids => (InputBlockUnclesKey, InputBlockUncles.fieldValue(ids))).toSeq
+
+    ExtensionCandidate(prevInput ++ Seq(txs, prevTxs) ++ uncles)
   }
 }
 
@@ -85,7 +92,8 @@ object CandidateBlock {
       "inputBlockFields" -> Map(
         "prevInputBlockId" -> c.inputBlockFields.prevInputBlockId.map(Algos.encode).asJson,
         "transactionsDigest" -> Algos.encode(c.inputBlockFields.transactionsDigest).asJson,
-        "prevTransactionsDigest" -> Algos.encode(c.inputBlockFields.prevTransactionsDigest).asJson
+        "prevTransactionsDigest" -> Algos.encode(c.inputBlockFields.prevTransactionsDigest).asJson,
+        "uncleIds" -> c.inputBlockFields.uncleIds.map(_.map(Algos.encode)).asJson
       ).asJson,
       "inputBlockTransactionIds" -> c.inputBlockTransactions.map(tx => Algos.encode(tx.id)).asJson,
       "orderingBlockTransactionIds" -> c.orderingBlockTransactions.map(tx => Algos.encode(tx.id)).asJson

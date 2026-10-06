@@ -93,6 +93,12 @@ object Extension extends ApiCodecs {
 
   val InputBlockKeys = Array(InputBlockTransactionsDigestKey, PreviousInputBlockTransactionsDigestKey, PrevInputBlockIdKey)
 
+  /**
+    * Uncles merged by an input block: concatenation of up to two 32-byte input block ids (empty if none).
+    * Written only by nodes running with input-block uncles enabled; other nodes ignore it.
+    */
+  val InputBlockUnclesKey: Array[Byte] = Array(InputBlocksDataPrefix, 0x03)
+
 
   /**
     * Prefix for keys related to sidechains data. Not used for now, reserved for future.

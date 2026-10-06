@@ -60,8 +60,12 @@ class ExtensionCandidate(val fields: Seq[(Array[Byte], Array[Byte])]) {
     if (indices.isEmpty) None else merkleTree.proofByIndices(indices)
   }
 
+  /**
+    * Proof for input block fields. The uncles field is proven along when present; keys missing from the
+    * extension are skipped, so an extension without uncles gets the same proof as before.
+    */
   def proofForInputBlockData: Option[BatchMerkleProof[Digest32]] = {
-    batchProofFor(Extension.InputBlockKeys :_* )
+    batchProofFor((Extension.InputBlockKeys :+ Extension.InputBlockUnclesKey) :_* )
   }
 
 }

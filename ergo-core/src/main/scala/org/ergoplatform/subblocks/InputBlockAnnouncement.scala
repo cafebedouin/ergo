@@ -55,6 +55,30 @@ case class InputBlockAnnouncement(version: Byte,
 
   def merkleProof: BatchMerkleProof[Digest32] = inputBlockFields.inputBlockFieldsProof
 
+  /**
+    * Uncle ids repeated by the announcement (version 2+, see InputBlockUncles), None for an earlier version or
+    * if the bytes are malformed. Whether they match the extension is checked by `unclesCommitted`.
+    */
+  lazy val uncleIdsOpt: Option[Seq[ModifierId]] = {
+    if (version >= InputBlockUncles.UnclesMessageVersion) {
+      InputBlockUncles.parseAnnouncementBytes(unparsedBytes)
+    } else {
+      None
+    }
+  }
+
+  /** Uncle ids repeated by the announcement, empty if none. */
+  def uncleIds: Seq[ModifierId] = uncleIdsOpt.getOrElse(Seq.empty)
+
+  /**
+    * Whether the announcement carries an uncles field which is one of the extension leaves proven by its Merkle
+    * proof (the proof itself is checked against the header's extension root in `valid`).
+    */
+  def unclesCommitted: Boolean = uncleIdsOpt.exists { ids =>
+    val leaf = InputBlockUncles.leafHash(ids)
+    merkleProof.indices.exists(_._2.sameElements(leaf))
+  }
+
 }
 
 object InputBlockAnnouncement {
