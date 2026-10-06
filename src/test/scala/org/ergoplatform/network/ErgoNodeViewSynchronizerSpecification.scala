@@ -4,6 +4,7 @@ import akka.actor.{ActorRef, ActorSystem, Cancellable, Props}
 import akka.testkit.{TestActorRef, TestProbe}
 import org.ergoplatform.modifiers.history.header.{Header, HeaderSerializer}
 import org.ergoplatform.modifiers.history.extension.Extension
+import org.ergoplatform.modifiers.history.BlockTransactions
 import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock, ManifestTypeId, UtxoSnapshotChunkTypeId}
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages._
 import org.ergoplatform.nodeView.ErgoNodeViewHolder
@@ -793,7 +794,7 @@ class ErgoNodeViewSynchronizerSpecification
 
       // we check that in case of neighbour with older history (it has more blocks),
       // sync message will be sent by our node (to get invs from the neighbour),
-      // sync message will consist of 4 headers
+      // sync message will contain the sampled headers followed by genesis
       synchronizer ! Message(ErgoSyncInfoMessageSpec, Left(msgBytes), Some(peer))
       ncProbe.fishForMessage(3 seconds) {
         case m =>
@@ -801,7 +802,9 @@ class ErgoNodeViewSynchronizerSpecification
             case stn: SendToNetwork =>
               val msg     = stn.message
               val headers = msg.data.get.asInstanceOf[ErgoSyncInfoV2].lastHeaders
-              msg.spec.messageCode == ErgoSyncInfoMessageSpec.messageCode && headers.length == 4
+              msg.spec.messageCode == ErgoSyncInfoMessageSpec.messageCode &&
+                headers.map(_.id) == (ErgoHistoryReader.FullV2SyncOffsets.toSeq
+                  .map(offset => localChain(localChain.size - offset - 1).id) :+ localChain.head.id)
             case _ => false
           }
       }
@@ -819,7 +822,7 @@ class ErgoNodeViewSynchronizerSpecification
 
       // we check that in case of neighbour with older history (it has more blocks),
       // sync message will be sent by our node (to get invs from the neighbour),
-      // sync message will consist of 4 headers
+      // sync message will contain the sampled headers followed by genesis
       synchronizer ! Message(ErgoSyncInfoMessageSpec, Left(msgBytes), Some(peer))
       ncProbe.fishForMessage(3 seconds) {
         case m =>
@@ -827,7 +830,9 @@ class ErgoNodeViewSynchronizerSpecification
             case stn: SendToNetwork =>
               val msg     = stn.message
               val headers = msg.data.get.asInstanceOf[ErgoSyncInfoV2].lastHeaders
-              msg.spec.messageCode == ErgoSyncInfoMessageSpec.messageCode && headers.length == 4
+              msg.spec.messageCode == ErgoSyncInfoMessageSpec.messageCode &&
+                headers.map(_.id) == (ErgoHistoryReader.FullV2SyncOffsets.toSeq
+                  .map(offset => localChain(localChain.size - offset - 1).id) :+ localChain.head.id)
             case _ => false
           }
       }
@@ -3035,7 +3040,7 @@ class ErgoNodeViewSynchronizerSpecification
       syncTracker.updateStatus(legacyPeer, Equal, Some(header.height))
 
       // Send NewBlockMined - immediate announcement of a locally mined block to all peers
-      synchronizerMockRef ! NewBlockMined(header)
+      synchronizerMockRef ! NewBlockMined(header, Seq.empty)
 
       // Should send inv for header and block sections (legacy peers receive them via broadcast)
       val messages = ncProbe.receiveWhile(max = 3 seconds, idle = 300.millis) {
@@ -3403,7 +3408,7 @@ class ErgoNodeViewSynchronizerSpecification
 
       // Send NewBlockMined - immediate announcement of a locally mined block
       // We verify that inv messages go out after this event
-      synchronizerMockRef ! NewBlockMined(header)
+      synchronizerMockRef ! NewBlockMined(header, Seq.empty)
 
       val messages = ncProbe.receiveWhile(max = 3 seconds, idle = 300.millis) {
         case m => m
@@ -4514,7 +4519,7 @@ class ErgoNodeViewSynchronizerSpecification
       val newBlock = statefulyValidFullBlock(wus)
 
       // Send NewBlockMined to synchronizer
-      synchronizerMockRef ! NewBlockMined(newBlock.header)
+      synchronizerMockRef ! NewBlockMined(newBlock.header, newBlock.blockSections)
 
       // Expect 4 inv messages (1 header + 3 sections)
       val invMessages = (0 until 4).map { _ =>
@@ -4539,6 +4544,99 @@ class ErgoNodeViewSynchronizerSpecification
   }
 
   /**
+    * A peer that asks for a block the node has just announced must get it, also before the node view holder has
+    * applied the block: otherwise the request waits the whole delivery timeout.
+    */
+  property("NodeViewSynchronizer: a newly mined block is served as soon as it is announced") {
+    withFixture2 { ctx =>
+      import ctx._
+
+      var wus = WrappedUtxoState(boxesHolderGen.sample.get, createTempDir, parameters, settings)
+      (0 until 3).foreach { _ =>
+        val block = statefulyValidFullBlock(wus)
+        wus = wus.applyModifier(block, None)(_ => ()).get
+      }
+      val newBlock = statefulyValidFullBlock(wus)
+      Thread.sleep(2000) // let the synchronizer take the view holder's start-up events
+
+      synchronizerMockRef ! NewBlockMined(newBlock.header, newBlock.blockSections) // as CandidateGenerator publishes it
+      // collect everything sent in the window, then keep the announcements (other messages may interleave)
+      val announced = ncProbe.receiveWhile(2.seconds) { case m => m }.collect {
+        case stn: SendToNetwork if stn.message.spec.messageCode == InvSpec.messageCode =>
+          stn.message.data.get.asInstanceOf[InvData]
+      }.flatMap(inv => inv.ids.map(inv.typeId -> _))
+      announced should contain(Header.modifierTypeId -> newBlock.header.id)
+      newBlock.header.sectionIds.foreach(section => announced should contain(section))
+
+      // the peer asks for everything it was told about, before the block is applied
+      announced.groupBy(_._1).foreach { case (typeId, ids) =>
+        synchronizerMockRef ! Message(RequestModifierSpec, Left(RequestModifierSpec.toBytes(InvData(typeId, ids.map(_._2)))), Some(peer))
+      }
+      // the synchronizer answers through the requesting peer's handler
+      val served = pchProbe.receiveWhile(3.seconds) { case m => m }.collect {
+        case msg: Message[_] if msg.spec.messageCode == ModifiersSpec.messageCode =>
+          msg.data.get.asInstanceOf[ModifiersData]
+      }.flatMap(md => md.modifiers.keys.map(md.typeId -> _))
+      announced.foreach(a => served should contain(a))
+    }
+  }
+
+  property("NodeViewSynchronizer: a newly mined block is no longer served from memory once applied") {
+    withFixture2 { ctx =>
+      import ctx._
+
+      var wus = WrappedUtxoState(boxesHolderGen.sample.get, createTempDir, parameters, settings)
+      (0 until 3).foreach { _ =>
+        val block = statefulyValidFullBlock(wus)
+        wus = wus.applyModifier(block, None)(_ => ()).get
+      }
+      val newBlock = statefulyValidFullBlock(wus)
+      Thread.sleep(2000) // let the synchronizer take the view holder's start-up events
+
+      synchronizerMockRef ! NewBlockMined(newBlock.header, newBlock.blockSections)
+      ncProbe.receiveWhile(2.seconds) { case m => m }
+      // in production history serves it after this event; this fixture's history never receives it, so a request that
+      // is still answered can only come from the in-memory copy
+      synchronizerMockRef ! LocalBlockApplied(newBlock.header, newBlock.transactions.map(_.id))
+
+      synchronizerMockRef ! Message(RequestModifierSpec,
+        Left(RequestModifierSpec.toBytes(InvData(Header.modifierTypeId, Seq(newBlock.header.id)))), Some(peer))
+      val served = pchProbe.receiveWhile(3.seconds) { case m => m }.collect {
+        case msg: Message[_] if msg.spec.messageCode == ModifiersSpec.messageCode =>
+          msg.data.get.asInstanceOf[ModifiersData]
+      }.flatMap(_.modifiers.keys)
+      served should not contain newBlock.header.id
+    }
+  }
+
+  property("NodeViewSynchronizer: a newly mined block reported invalid is no longer served") {
+    withFixture2 { ctx =>
+      import ctx._
+
+      var wus = WrappedUtxoState(boxesHolderGen.sample.get, createTempDir, parameters, settings)
+      (0 until 3).foreach { _ =>
+        val block = statefulyValidFullBlock(wus)
+        wus = wus.applyModifier(block, None)(_ => ()).get
+      }
+      val newBlock = statefulyValidFullBlock(wus)
+      Thread.sleep(2000) // let the synchronizer take the view holder's start-up events
+
+      synchronizerMockRef ! NewBlockMined(newBlock.header, newBlock.blockSections)
+      ncProbe.receiveWhile(2.seconds) { case m => m }
+      synchronizerMockRef ! SemanticallyFailedModification(
+        BlockTransactions.modifierTypeId, newBlock.blockTransactions.id, new Exception("invalid"))
+
+      synchronizerMockRef ! Message(RequestModifierSpec,
+        Left(RequestModifierSpec.toBytes(InvData(Header.modifierTypeId, Seq(newBlock.header.id)))), Some(peer))
+      val served = pchProbe.receiveWhile(3.seconds) { case m => m }.collect {
+        case msg: Message[_] if msg.spec.messageCode == ModifiersSpec.messageCode =>
+          msg.data.get.asInstanceOf[ModifiersData]
+      }.flatMap(_.modifiers.keys)
+      served should not contain newBlock.header.id
+    }
+  }
+
+  /**
     * Test that LocalBlockApplied does not duplicate broadcast when NewBlockMined already fired.
     */
   property("NodeViewSynchronizer: NewBlockMined should prevent duplicate broadcast on LocalBlockApplied") {
@@ -4555,7 +4653,7 @@ class ErgoNodeViewSynchronizerSpecification
       val newBlock = validFullBlock(bestBlockOpt, us, bh)
 
       // First: NewBlockMined triggers immediate broadcast
-      synchronizerMockRef ! NewBlockMined(newBlock.header)
+      synchronizerMockRef ! NewBlockMined(newBlock.header, newBlock.blockSections)
 
       // Consume all inv messages from NewBlockMined
       ncProbe.receiveWhile(2.seconds) {
@@ -4588,7 +4686,7 @@ class ErgoNodeViewSynchronizerSpecification
       val newBlock = validFullBlock(bestBlockOpt, us, bh)
 
       // NewBlockMined should broadcast
-      synchronizerMockRef ! NewBlockMined(newBlock.header)
+      synchronizerMockRef ! NewBlockMined(newBlock.header, newBlock.blockSections)
 
       // Consume the inv messages
       val deadline1 = System.currentTimeMillis() + 2000
@@ -4665,7 +4763,7 @@ class ErgoNodeViewSynchronizerSpecification
       val newBlock = statefulyValidFullBlock(wus)
 
       // Send NewBlockMined to synchronizer
-      synchronizerMockRef ! NewBlockMined(newBlock.header)
+      synchronizerMockRef ! NewBlockMined(newBlock.header, newBlock.blockSections)
 
       // Expect 4 inv messages (1 header + 3 sections)
       val invMessages = (0 until 4).map { _ =>

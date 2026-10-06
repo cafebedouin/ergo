@@ -78,7 +78,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
   private var syncInfoV1CacheByHeadersHeight: Option[(Int, ErgoSyncInfoV1)] = Option.empty
 
-  private var syncInfoV2CacheByHeadersHeight: Option[(Int, ErgoSyncInfoV2)] = Option.empty
+  private val syncInfoV2Cache = new SyncInfoV2Cache
 
   private val networkSettings: NetworkSettings = settings.scorexSettings.network
 
@@ -157,6 +157,18 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     * Timestamp of last CheckModifiersToDownload command processing, used to not to process it too extensively
     */
   private var lastCheckForModifiersToDownload: Long = 0L
+
+  // Header and sections of blocks this node mined and has not applied yet, by id (at most the last 4): a mined block is
+  // announced before the node view holder applies it, so a peer's request can arrive before history has it
+  private val MinedBlocksToServe = 4
+  private var minedToServe: Vector[Map[ModifierId, (NetworkObjectTypeId.Value, Array[Byte])]] = Vector.empty
+
+  private def minedModifier(id: ModifierId): Option[(NetworkObjectTypeId.Value, Array[Byte])] =
+    minedToServe.iterator.flatMap(_.get(id)).toSeq.headOption
+
+  // a mined block is served from here until it is applied, or dropped if its header or a section turned out invalid
+  private def dropMinedContaining(id: ModifierId): Unit =
+    minedToServe = minedToServe.filterNot(_.contains(id))
 
   /**
     * How many block sections stored in processing queue, imprecise number as updated only when
@@ -339,14 +351,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
   /** Get V2 sync info from cache or load it from history and add to cache */
   private def getV2SyncInfo(history: ErgoHistory, full: Boolean): ErgoSyncInfoV2 = {
-    val headersHeight = history.headersHeight
-    syncInfoV2CacheByHeadersHeight
-      .collect { case (height, syncInfo) if height == headersHeight => syncInfo }
-      .getOrElse {
-        val v2SyncInfo = history.syncInfoV2(full)
-        syncInfoV2CacheByHeadersHeight = Some(headersHeight -> v2SyncInfo)
-        v2SyncInfo
-      }
+    syncInfoV2Cache.getOrElseUpdate(history.bestHeaderIdOpt, full)(history.syncInfoV2(full))
   }
 
   /**
@@ -1191,7 +1196,12 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
           Seq.empty
         } else {
           log.info(s"Processing ${invData.ids.length} non-tx invs (of type $modifierTypeId) from $peer")
-          invData.ids.filter(mid => deliveryTracker.status(mid, modifierTypeId, Seq(hr)) == ModifiersStatus.Unknown)
+          invData.ids.filter { mid =>
+            deliveryTracker.status(mid, modifierTypeId, Seq(hr)) == ModifiersStatus.Unknown &&
+              // input blocks are not kept in the modifier store: an announced one this node already holds
+              // (e.g. its own, announced back by a relaying peer) is not requested again
+              !(modifierTypeId == InputBlockTypeId.value && hr.getInputBlock(mid).isDefined)
+          }
         }
     }
 
@@ -1257,7 +1267,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
           }
         case expectedTypeId: NetworkObjectTypeId.Value =>
           invData.ids.flatMap { id =>
-            hr.modifierTypeAndBytesById(id).flatMap { case (mTypeId, bytes) =>
+            minedModifier(id).orElse(hr.modifierTypeAndBytesById(id)).flatMap { case (mTypeId, bytes) =>
               if (mTypeId == expectedTypeId) {
                 Some(id -> bytes)
               } else {
@@ -1415,6 +1425,21 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   }
 
   /**
+    * Peers an input block (or its id) is sent to: those supporting sub-blocks, in UTXO mode, and within two blocks
+    * of this node's full-block height.
+    */
+  private def inputBlockRecipients(historyReader: ErgoHistoryReader): Seq[ConnectedPeer] = {
+    syncTracker.statuses.filter { s =>
+      val peer = s._1
+      val peerHeight = s._2.height
+      SubBlocksFilter.condition(peer) &&
+        peer.mode.exists(_.stateType == StateType.Utxo) &&
+        peerHeight <= historyReader.fullBlockHeight + 2 &&
+        peerHeight >= historyReader.fullBlockHeight - 2
+    }.keys.toSeq
+  }
+
+  /**
    * Request an input block from a peer by its ID.
    *
    * This method sends a request to the specified peer to download an input block with the given ID.
@@ -1499,6 +1524,9 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     // Skip already known input blocks
     if (hr.getInputBlock(subBlockId).isDefined) {
       log.debug(s"Input block $subBlockId already known, ignoring")
+      // a copy requested before this one was stored (e.g. asked for after a relayed id while a push was in
+      // flight) was still delivered: mark it received so the supplier is not treated as non-delivering
+      setReceivedIfRequested(subBlockId, InputBlockTypeId.value, remote)
       return
     }
 
@@ -2197,7 +2225,9 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       * propagation latency. LocalBlockApplied arrives later and skips broadcast
       * since the block was already announced.
       */
-    case NewBlockMined(header) =>
+    case NewBlockMined(header, sections) =>
+      val served = (header +: sections).map(m => m.id -> (m.modifierTypeId -> m.bytes)).toMap
+      minedToServe = (minedToServe :+ served).takeRight(MinedBlocksToServe)
       log.info(
         s"Immediately announcing newly mined block ${header.encodedId} " +
         s"at height ${header.height} to all peers"
@@ -2209,6 +2239,8 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     // Locally mined block applied - skip broadcast (already done via NewBlockMined)
     case LocalBlockApplied(header, _) =>
+      // applied: history serves it from now on (#2414)
+      dropMinedContaining(header.id)
       log.debug(
         s"Local block applied at height ${header.height}, " +
         s"header id: ${header.encodedId}, skipping broadcast"
@@ -2285,10 +2317,12 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     case SyntacticallyFailedModification(modTypeId, modId, e) =>
       logger.debug(s"Invalidating syntactically failed modifier $modId", e)
+      dropMinedContaining(modId)
       deliveryTracker.setInvalid(modId, modTypeId).foreach(penalizeMisbehavingPeer)
 
     case SemanticallyFailedModification(modTypeId, modId, e) =>
       logger.debug(s"Invalidating semantically failed modifier $modId", e)
+      dropMinedContaining(modId)
       deliveryTracker.setInvalid(modId, modTypeId).foreach(penalizeMisbehavingPeer)
 
     case ChangedHistory(newHistoryReader: ErgoHistory) =>
@@ -2346,6 +2380,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     case NewBestInputBlock(Some(id), local) =>
       historyReader.getInputBlock(id) match {
         case Some(preIbi) =>
+          val peers = inputBlockRecipients(historyReader)
           if (local) {
             log.debug(s"Sending locally generated input block $id out")
 
@@ -2357,19 +2392,14 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
             } else {
               preIbi.copy(weakTxIds = None)
             }
-            val peers = syncTracker.statuses.filter { s =>
-              val peer = s._1
-              val peerHeight = s._2.height
-              // send input block to peers on same height and also supporting sub-blocks and in utxo mode
-              SubBlocksFilter.condition(peer) &&
-                peer.mode.exists(_.stateType == StateType.Utxo) &&
-                peerHeight <= historyReader.fullBlockHeight + 2 &&
-                peerHeight >= historyReader.fullBlockHeight - 2
-            }.keys.toSeq
             val msg = Message(InputBlockMessageSpec, Right(ibi), None)
             networkControllerRef ! SendToNetwork(msg, SendToPeers(peers))
-          } else {
-            // todo: send only id out
+          } else if (peers.nonEmpty) {
+            // an input block received from a peer: announce its id only, as ordering-block announcements are
+            // relayed, so it travels beyond the miner's own peers; a peer that lacks it requests it
+            // (processInv -> modifiersReq -> processInputBlockRequest)
+            val msg = Message(InvSpec, Right(InvData(InputBlockTypeId.value, Seq(id))), None)
+            networkControllerRef ! SendToNetwork(msg, SendToPeers(peers))
           }
         case None =>
           // shouldnt be there by input block processing logic
@@ -2490,6 +2520,22 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 }
 
 object ErgoNodeViewSynchronizer {
+
+  /** Single-entry cache owned by the synchronizer actor. */
+  private[network] final class SyncInfoV2Cache {
+    private var cached: Option[(Option[ModifierId], Boolean, ErgoSyncInfoV2)] = None
+
+    def getOrElseUpdate(bestHeaderId: Option[ModifierId], full: Boolean)
+                       (build: => ErgoSyncInfoV2): ErgoSyncInfoV2 = {
+      cached.collect {
+        case (tip, mode, info) if tip == bestHeaderId && mode == full => info
+      }.getOrElse {
+        val info = build
+        cached = Some((bestHeaderId, full, info))
+        info
+      }
+    }
+  }
 
   private def props(networkControllerRef: ActorRef,
             viewHolderRef: ActorRef,

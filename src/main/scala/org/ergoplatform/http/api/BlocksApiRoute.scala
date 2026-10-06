@@ -144,7 +144,7 @@ case class BlocksApiRoute(viewHolderRef: ActorRef, readersHolder: ActorRef, ergo
       // and skips broadcast since the block was already announced.
       // TODO: Consider switching to direct actor message for lower latency
       //       instead of event bus publish.
-      context.eventStream.publish(NewBlockMined(block.header))
+      context.eventStream.publish(NewBlockMined(block.header, block.blockSections))
 
       ApiResponse.OK
     } else {
@@ -190,7 +190,7 @@ case class BlocksApiRoute(viewHolderRef: ActorRef, readersHolder: ActorRef, ergo
     ApiResponse(getFullBlockByHeaderId(id).map(_.map(_.blockTransactions)))
   }
 
-  def getFullBlockByHeaderIdR: Route = (modifierId & get) { id =>
+  def getFullBlockByHeaderIdR: Route = (modifierId & pathEndOrSingleSlash & get) { id =>
     ApiResponse(getFullBlockByHeaderId(id))
   }
 

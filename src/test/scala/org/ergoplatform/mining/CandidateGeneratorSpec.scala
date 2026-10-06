@@ -10,7 +10,7 @@ import org.ergoplatform.network.message.inputblocks.InputBlockTransactionsData
 import org.ergoplatform.subblocks.InputBlockAnnouncement
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.history.BlockTransactions
-import org.ergoplatform.modifiers.history.header.Header
+import org.ergoplatform.modifiers.history.header.{Header, HeaderWithoutPow}
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction, UnsignedErgoTransaction}
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{ChangedMempool, FullBlockApplied, LocalBlockApplied, SemanticallyFailedModification}
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.{EliminateTransactions, LocallyGeneratedTransaction}
@@ -27,7 +27,9 @@ import org.ergoplatform.utils.generators.ValidBlocksGenerators.{createUtxoState,
 import org.ergoplatform.utils.generators.ChainGenerator.{applyChain, genHeaderChain}
 import org.ergoplatform.utils.{HistoryTestHelpers, RandomWrapper}
 import org.ergoplatform.validation.MalformedModifierError
-import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input, OrderingSolutionFound}
+import org.ergoplatform.{AutolykosSolution, ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input, OrderingBlockHeaderFound, OrderingSolutionFound, ProveBlockResult}
+import org.ergoplatform.settings.Parameters
+import scorex.crypto.hash.Digest32
 import org.scalatest.concurrent.Eventually
 import org.scalatest.flatspec.AnyFlatSpec
 import sigma.ast.ErgoTree
@@ -1598,5 +1600,89 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
 
     system.terminate()
   }
+
+
+  /** Test PoW under which a solution fits only the candidate it was mined on: the one valid nonce is derived from the
+    * header's message (everything but the solution), so two candidates never share a valid nonce. */
+  private class CandidateBoundPowScheme extends DefaultFakePowScheme(32, 26) {
+    def nonceFor(h: HeaderWithoutPow): Array[Byte] = msgByHeader(h).take(8)
+    override def validate(header: Header): Try[Unit] = Try {
+      require(java.util.Arrays.equals(header.powSolution.n, nonceFor(header)), "nonce does not fit this header")
+    }
+    // input solutions are bound to their candidate the same way
+    override def checkInputBlockPoW(header: Header, parameters: Parameters): Boolean =
+      java.util.Arrays.equals(header.powSolution.n, nonceFor(header))
+    override def prove(parentOpt: Option[Header], version: Header.Version, nBits: Long, stateRoot: ADDigest,
+                       adProofsRoot: Digest32, transactionsRoot: Digest32, timestamp: Header.Timestamp,
+                       extensionHash: Digest32, votes: Array[Byte], sk: PrivateKey, minNonce: Long, maxNonce: Long,
+                       parameters: Parameters): ProveBlockResult =
+      super.prove(parentOpt, version, nBits, stateRoot, adProofsRoot, transactionsRoot, timestamp, extensionHash, votes,
+        sk, minNonce, maxNonce, parameters) match {
+        case OrderingBlockHeaderFound(h) =>
+          val s = h.powSolution
+          OrderingBlockHeaderFound(h.copy(powSolution = new AutolykosSolution(s.pk, s.w, nonceFor(h), s.d)))
+        case other => other
+      }
+  }
+
+  /** A generator on a fresh chain under [[CandidateBoundPowScheme]], one block mined so candidates have a parent. */
+  private class BoundPowFixture(name: String)(implicit system: ActorSystem) {
+    val boundPow = new CandidateBoundPowScheme
+    val probe = new TestProbe(system)
+    system.eventStream.subscribe(probe.ref, newBlockSignal)
+    val settings: ErgoSettings = {
+      val base = ErgoSettingsReader.read()
+      base.copy(
+        nodeSettings = defaultSettings.nodeSettings.copy(blockCandidateGenerationInterval = 1.millis),
+        chainSettings = base.chainSettings.copy(blockInterval = 1.seconds, powScheme = boundPow),
+        directory = s"${defaultSettings.directory}-$name-${System.currentTimeMillis()}"
+      )
+    }
+    val powScheme = settings.chainSettings.powScheme
+    val viewHolderRef: ActorRef = ErgoNodeViewRef(settings)
+    val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+    val generator: ActorRef = CandidateGenerator(defaultMinerSecret.publicImage, readersHolderRef, viewHolderRef, settings)
+
+    def candidate(forced: Boolean): Candidate = {
+      generator.tell(GenerateCandidate(Seq.empty, reply = true, forced = forced), probe.ref)
+      // the first request waits for the genesis state, which can take several seconds
+      probe.fishForMessage(newBlockDelay) { case StatusReply.Success(_: Candidate) => true; case _ => false } match {
+        case StatusReply.Success(c: Candidate) => c
+      }
+    }
+    def solve(c: Candidate): Header =
+      powScheme.proveCandidate(c.candidateBlock, defaultMinerSecret.w, 0, 1000, c.parameters) match {
+        case org.ergoplatform.OrderingBlockFound(b) => b.header
+        case other => throw new RuntimeException(s"Unexpected result from proveCandidate: $other")
+      }
+
+    // one block, so that the candidates below share a parent
+    private val first = solve(candidate(forced = false))
+    generator.tell(OrderingSolutionFound(first.powSolution), probe.ref)
+    probe.fishForMessage(newBlockDelay) { case FullBlockApplied(h) => h.id == first.id; case _ => false }
+  }
+
+  it should "accept the next solution after a regeneration on the solved block came before its FullBlockApplied" in
+    new TestKit(ActorSystem()) {
+      val f = new BoundPowFixture("solved-race")
+      // deliver FullBlockApplied to the generator by hand, to force the order seen in smoke 1
+      system.eventStream.unsubscribe(f.generator, classOf[FullBlockApplied])
+      val solved = f.solve(f.candidate(forced = false))
+      f.generator.tell(OrderingSolutionFound(solved.powSolution), f.probe.ref)
+      f.probe.fishForMessage(newBlockDelay) { case FullBlockApplied(h) => h.id == solved.id; case _ => false }
+      // a regeneration (e.g. after an input block) on the new best block, before the generator sees FullBlockApplied
+      val next = f.candidate(forced = true)
+      next.candidateBlock.parentOpt.map(_.id) shouldBe Some(solved.id)
+      f.generator ! LocalBlockApplied(solved, Seq.empty)
+      // the next solution must not get "Block already solved"
+      val nextSolved = f.solve(next)
+      f.generator.tell(OrderingSolutionFound(nextSolved.powSolution), f.probe.ref)
+      f.probe.fishForMessage(newBlockDelay) {
+        case FullBlockApplied(h) => h.id == nextSolved.id
+        case StatusReply.Error(e) => fail(s"next solution rejected: ${e.getMessage}")
+        case _ => false
+      }
+      system.terminate()
+    }
 
 }
