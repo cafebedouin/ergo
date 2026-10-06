@@ -16,6 +16,20 @@ uncertain are written conservatively, for example with explicit lambdas instead 
 polymorphic methods, and with no unused imports, locals or pattern variables, because sbt-tpolecat runs in its
 default CI mode and makes warnings fatal.
 
+**Results reported by the maintainer** (GitHub runners, base weak-blocks b2a9e7b00 + this branch):
+- Compile errors in `ErgoMiningThread` (two `Candidate(...)` patterns with 4 fields) are fixed on the branch.
+- Passing: `InputBlockUnclesSpec` 6/0, `InputBlockUnclesSpecification` 14/0 and `CandidateGeneratorUnclesSpec` 8/0.
+- No regressions: `InputBlockProcessorSpecification` 65/0, `ErgoNodeViewHolderSpec` 150/0,
+  `ErgoNodeViewSynchronizerSpecification` 96/0 and `ErgoSettingsSpecification` 7/0.
+- `CandidateGeneratorSpec` is noisy on those runners, with 13-14 failures on the bare base too.
+- `ErgoNodeViewHolderUnclesSpec`, "rebuilt from L and uncles", failed because of its fixture. Its input blocks
+  carried the transactions of a generated full block, which include a reward transaction (soft field
+  `minerPubKey`) and outputs created above the current height. Those blocks were rejected, so there was nothing
+  to rebuild from. The fixture now uses ordinary transactions: A splits a genesis output, B (child of A) spends
+  one half, and S (sibling of B) spends the other. The test first asserts that the input blocks were applied and
+  that S was validated, and that `orderingBlockCollectedTransactions` gives A, B, S. Only then does it send the
+  ordering block. The rewritten fixture has not been run yet.
+
 Spec classes to run (new):
 
 ```
@@ -194,7 +208,9 @@ sbt "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockPro
    the linked one (`0x03 0x02`) in the parent's tree, L along it, then the ordering block's uncles, then its own
    transactions. It checks the transactions root and falls back to the full download on a mismatch or when
    anything is missing.
-   *Deviation:* with the flag off the base reconstruction is kept unchanged, to keep "flag off = base". Fixing it
+   *Deviation:* with the flag off the base reconstruction is kept unchanged, to keep "flag off = base". The
+   flag-off fix is correct, but it is a fix to the base, not part of uncles, and leaving it out keeps the
+   flag-off comparison runs equal to the stack. Fixing it
    independently of uncles is a two-line change: use the parent's tree and put the collected transactions first.
    It is recommended.
 

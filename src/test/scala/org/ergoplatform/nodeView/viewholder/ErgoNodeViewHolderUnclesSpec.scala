@@ -7,8 +7,9 @@ import org.ergoplatform.modifiers.history.extension.{Extension, ExtensionCandida
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages._
 import org.ergoplatform.network.message.inputblocks.{InputBlockTransactionsData, OrderingBlockAnnouncement}
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.{DownloadInputBlock, DownloadRequest}
-import org.ergoplatform.nodeView.state.StateType
+import org.ergoplatform.nodeView.state.{ErgoState, StateType}
 import org.ergoplatform.nodeView.state.wrapped.WrappedUtxoState
+import org.ergoplatform.settings.Constants.TrueTree
 import org.ergoplatform.settings.ErgoSettings
 import org.ergoplatform.subblocks.InputBlockUncles
 import org.ergoplatform.utils.{ErgoCorePropertyTest, InputBlockUnclesTestHelpers, NodeViewTestConfig, NodeViewTestOps}
@@ -59,9 +60,20 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
     }
   }
 
+  /** Polls until the condition holds or the timeout passes. */
+  private def awaitCondition(timeout: FiniteDuration)(condition: => Boolean): Boolean = {
+    val deadline = System.currentTimeMillis() + timeout.toMillis
+    while (!condition && System.currentTimeMillis() < deadline) Thread.sleep(100)
+    condition
+  }
+
   /**
-    * Input blocks A (first transaction of a valid block) and S (second one) are both children of the ordering
-    * block; the next ordering block links A, merges S as an uncle and has the rest of the transactions.
+    * After the genesis block, input blocks of the next ordering block built from ordinary transactions
+    * (anyone-can-spend boxes, outputs at the creation height of the spent box, no double spends):
+    * A splits a genesis output into two, B (child of A) spends one half, S (sibling of B) spends the other.
+    * The next ordering block links B and merges S as an uncle, with no transactions of its own, so its
+    * transactions are L(B) ++ S = A, B, S. First asserts that the input blocks were applied, so a fixture
+    * problem can not read as a reconstruction failure.
     */
   private def orderingBlockOverInputBlocks(uncles: Boolean)(expectRebuilt: (NodeViewFixture, OrderingBlockAnnouncement) => Unit): Unit = {
     new NodeViewFixture(nodeSettings(uncles), parameters).apply { fixture =>
@@ -71,24 +83,44 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
       applyBlock(genesis).isSuccess shouldBe true
       val wus = WrappedUtxoState(us, bh, fixture.settings).applyModifier(genesis)(_ => ()).get
 
-      val nextBlock = validFullBlock(Some(genesis), wus)
-      val txs = nextBlock.blockTransactions.txs
-      assume(txs.size >= 2)
+      val trueBoxes = ErgoState.newBoxes(genesis.transactions).filter(_.ergoTree == TrueTree)
+      trueBoxes.nonEmpty shouldBe true
+      val box = trueBoxes.maxBy(_.value)
+      val aTx = split(box)
+      val bTx = spend(aTx.outputs(0))
+      val sTx = spend(aTx.outputs(1))
 
-      val a = announceOn(validFullBlock(Some(genesis), wus).header, None, txs.take(1))
-      val s = announceOn(validFullBlock(Some(genesis), wus).header, None, txs.slice(1, 2))
-      Seq(a -> txs.take(1), s -> txs.slice(1, 2)).foreach { case (ib, ibTxs) =>
+      val a = announceOn(validFullBlock(Some(genesis), wus).header, None, Seq(aTx))
+      val b = announceOn(validFullBlock(Some(genesis), wus).header, Some(a.id), Seq(bTx))
+      val s = announceOn(validFullBlock(Some(genesis), wus).header, Some(a.id), Seq(sTx))
+      Seq(a -> aTx, b -> bTx, s -> sTx).foreach { case (ib, tx) =>
         nodeViewHolderRef ! ProcessInputBlock(ib, peer(fixture))
-        nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(ib.id, ibTxs))
+        nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(ib.id, Seq(tx)))
       }
-      Thread.sleep(1000)
-      getHistory.getInputBlockTransactions(s.id).isDefined shouldBe true
 
+      // the input blocks were applied: A <- B is the best input chain, S is stored (and, with uncles enabled,
+      // validated as a sibling)
+      awaitCondition(10.seconds) {
+        getHistory.bestInputBlocksChain() == Seq(b.id, a.id) && getHistory.getInputBlockTransactions(s.id).isDefined &&
+          (!uncles || getHistory.getInputBlockValidity(s.id).contains(true))
+      } shouldBe true
+      if (uncles) {
+        getHistory.getInputBlockValidity(a.id) shouldBe Some(true)
+        getHistory.getInputBlockValidity(b.id) shouldBe Some(true)
+        getHistory.mergeableUncleCandidates() shouldBe Seq(s.id)
+      }
+
+      // the next ordering block, with the transactions A, B, S in the collected order
+      val nextBlock = validFullBlock(Some(genesis), wus, Seq(aTx, bTx, sTx))
       val fields = nextBlock.extension.fields ++ Seq(
-        Extension.PrevInputBlockIdKey -> idToBytes(a.id),
+        Extension.PrevInputBlockIdKey -> idToBytes(b.id),
         Extension.InputBlockUnclesKey -> InputBlockUncles.fieldValue(Seq(idToBytes(s.id))))
       val header = nextBlock.header.copy(extensionRoot = ExtensionCandidate(fields).digest)
-      val oba = OrderingBlockAnnouncement(OrderingBlockAnnouncement.CurrentVersion, header, txs.drop(2), Seq.empty, fields)
+      if (uncles) {
+        getHistory.orderingBlockCollectedTransactions(genesis.id, fields).map(_.map(_.id)) shouldBe
+          Some(Seq(aTx, bTx, sTx).map(_.id))
+      }
+      val oba = OrderingBlockAnnouncement(OrderingBlockAnnouncement.CurrentVersion, header, Seq.empty, Seq.empty, fields)
 
       subscribeEvents(classOf[SyntacticallySuccessfulModifier])
       subscribeEvents(classOf[DownloadRequest])
