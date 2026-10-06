@@ -370,3 +370,33 @@ New tests:
 Each of the first three fails without the corresponding fix: (i) and (ii) fell back to a download, and the
 generator test produced a block merging S2 twice, or does not compile without `candidateParentInputBlock`.
 None of them was compiled or run here.
+
+## Round 4: flaky view-holder reproductions
+
+Both failures were in the fixture, not in the production path, and not a timing problem.
+- **The failing lines:** both are the fixture's "applied first" checks, not the relay or rebuild assertions.
+  - Line 208 in (i) waits for the best chain X, A.
+  - Line 250 in (ii) is `bestInputBlocksChain() shouldBe Seq(a.id)`, the "C waits for its uncle" check. It got
+    `List()`. The relay assertion comes after it.
+  - Both mean A, the fixture's first input block, was never processed.
+- **The cause:** the shared test helper `split` copied the spent box's tokens onto *both* outputs.
+  - `genesisWithTransactions` splits the largest anyone-can-spend output of a random genesis block. When that box
+    carried tokens, A's transaction created them twice, and the input block was rightly rejected.
+  - The other boxes the specs use carry no tokens, so only these fixtures were affected, at random.
+  - The round-2 fixture (`orderingBlockOverInputBlocks`) picks its box the same way, so it had the same exposure.
+- **Fix:**
+  - `split` now puts the tokens on its first output only.
+  - Both view-holder fixtures prefer a box without tokens.
+  - The reproductions now assert, as soon as A is processed, that it was recorded valid. A fixture problem now
+    fails at its source.
+- **Production path checked for the suggested races:**
+  - The relay event is published by the node view holder in the same message handling, after the sibling's
+    validity is recorded.
+  - Pending ordering blocks are retried in the same handling of every input-block transactions message. That
+    includes the path where transactions arrived before the announcement, which goes through
+    `processInputBlockTransactions` too.
+  - Both run on the single actor thread, so there is no interleaving to race with.
+- **The "Merkle root does not match" log line:** that exact text exists only on the flag-off path. The flag-on
+  path logs "Merkle root of rebuilt transactions does not match …", so the line came from the flag-off control
+  test, as expected.
+- Also removed the unused `val inChain` in `mergeableUncleCandidates` (it was a fatal warning).
