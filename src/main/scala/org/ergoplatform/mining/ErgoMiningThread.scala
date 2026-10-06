@@ -57,7 +57,7 @@ class ErgoMiningThread(
 
   override def receive: Receive = {
     case _: FullBlockApplied => requestCandidate()
-    case StatusReply.Success(Candidate(candidateBlock, _, _, parameters)) =>
+    case StatusReply.Success(Candidate(candidateBlock, _, _, parameters, _)) =>
       log.info(s"Initiating block mining")
       startChain(epoch = 1, nonce = 0, candidateBlock, parameters, solvedBlocksCount = 0)
     case StatusReply.Error(ex) =>
@@ -81,7 +81,7 @@ class ErgoMiningThread(
     parameters: Parameters,
     solvedBlocksCount: Int
   ): Receive = {
-    case StatusReply.Success(Candidate(cb, _, _, newParameters)) =>
+    case StatusReply.Success(Candidate(cb, _, _, newParameters, _)) =>
       // if we get new candidate instead of a cached one, mine it
       if (cb.timestamp != candidateBlock.timestamp) {
         startChain(epoch + 1, nonce = 0, cb, newParameters, solvedBlocksCount)
