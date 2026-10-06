@@ -308,3 +308,65 @@ Changes:
   nothing else supplies them in the test, instead of failing on the first download request. The flag-off control
   also asserts that they are not applied. `InputBlockUnclesSpecification` covers the rebuild function, both match
   and mismatch.
+
+## Round 3: reconstruction fallbacks and generator/validator disagreement (network smoke)
+
+Findings (by reading the code; the smoke logs were not available here):
+
+1. **Siblings were never relayed.** The synchronizer broadcasts an input block only on `NewBestInputBlock`, so a
+   sibling never left its node. That includes a miner's own solution on an earlier candidate, which is exactly
+   what uncles merge. An ordering block merging such an uncle could not be rebuilt by anyone else. The reason
+   came from `mergeUncleTransactions`, which returned "not available" without logging anything. That matches the
+   smoke: every block on the linked path held, and no uncle warning before. Input blocks merging the uncle only
+   worked through the missing-uncle download.
+   *Fix:* the node view holder publishes `NewInputBlockSibling(id, local)` for an input block found valid that
+   is not the new best. The synchronizer relays it the way it relays best input blocks: the full message if
+   local, the id if received.
+2. **The rebuild was tried once only.** An ordering block arriving moments before a missing input block, path
+   element or uncle transaction list fell back to a full download.
+   *Fix (flag on):* `rebuildOrderingBlock` keeps such an ordering block pending, up to 16 of them, and retries
+   it whenever input-block transactions are processed. After `OrderingBlockRebuildWait` (2 s) it makes one last
+   attempt and then downloads. A root mismatch is downloaded at once. With the flag on, the synchronizer also
+   hands an ordering block to the node view holder when its linked input block is not stored yet, instead of
+   downloading directly, so that case waits too.
+3. **The generator and validation judged uncles against different chains.** The generator built on `bestTip`,
+   the last element of the best fork, which is often an input block whose transactions have not arrived yet.
+   It judged uncles against the processed chain only. Validation judges them against the chain up to the
+   block's parent. So when the unprocessed tail merged a sibling, the generator merged it again ("merged by an
+   earlier element"). When a recorded-valid block sat in the tail, the generator chose it as an uncle ("is an
+   element of the chain").
+   *Fix:*
+   - With the flag on, the candidate builds on `candidateParentInputBlock()`, the processed tip, and the
+     cache key uses it as well. The collected transactions, the uncle candidates and the validation of the
+     block now all use the same chain.
+   - The uncle rule is one function, `uncleRuleViolation`. `applyWithUncles` and `mergeableUncleCandidates`
+     both use it.
+   - Flag off: `candidateParentInputBlock()` is `bestBlocks._2`, as before.
+
+Note that appending an ordering block's header always makes the node request the block's missing sections
+(`requestDownloads`), whatever the rebuild does. A fallback is only counted when the rebuild path logs
+"Downloading block transactions fully".
+
+**Diagnostics:** every "not available" reason now says exactly what is missing, and names the tree searched:
+- the linked input block is not known;
+- a path element is not known, or belongs to another tree;
+- a path element's transaction id list is not stored, or one of its transactions is not in the cache;
+- the transaction list of an uncle of a path element is missing (with whether its record and id list are
+  known);
+- the transaction list of an uncle of the ordering block is missing (same details).
+
+`rebuildOrderingBlockTransactions` returns `InputBlocksMissing` or `RootMismatch`.
+
+New tests:
+- `ErgoNodeViewHolderUnclesSpec`:
+  - (i) "ordering block linking an input block mined locally moments earlier, uncle arriving right after"
+  - (ii) "ordering block whose chain element merges an uncle, received right around the uncle". This one also
+    asserts the sibling relay.
+- `CandidateGeneratorUnclesSpec`: "generator and validation agree on uncles when siblings were merged earlier
+  and the chain has an unprocessed tail".
+- `InputBlockUnclesSpecification`: "each reason for collected transactions not being available names what is
+  missing".
+
+Each of the first three fails without the corresponding fix: (i) and (ii) fell back to a download, and the
+generator test produced a block merging S2 twice, or does not compile without `candidateParentInputBlock`.
+None of them was compiled or run here.
