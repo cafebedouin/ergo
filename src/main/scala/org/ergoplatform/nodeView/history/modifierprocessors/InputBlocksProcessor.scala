@@ -1634,7 +1634,6 @@ trait InputBlocksProcessor extends ScorexLogging {
           if (chainIds.isEmpty) {
             Seq.empty
           } else {
-            val inChain = chainIds.toSet
             val merged = chainIds.flatMap(uncleIdsOf).toSet
             val depth = chainIds.zipWithIndex.toMap
             inputBlockValidity.collect { case (id, true) => id }.toSeq
