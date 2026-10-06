@@ -7,7 +7,7 @@ import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.network.message.inputblocks.OrderingBlockAnnouncement
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
-import org.ergoplatform.nodeView.history.modifierprocessors.InputBlocksProcessor.UnclesNotAvailable
+import org.ergoplatform.nodeView.history.modifierprocessors.InputBlocksProcessor.{InputBlocksMissing, RebuildFailure, RootMismatch, UnclesNotAvailable}
 import org.ergoplatform.nodeView.state.ErgoState
 import org.ergoplatform.settings.Algos
 import org.ergoplatform.subblocks.{InputBlockAnnouncement, InputBlockUncles}
@@ -270,14 +270,10 @@ trait InputBlocksProcessor extends ScorexLogging {
         } else if (uncles.distinct.length != uncles.length) {
           Some("duplicate uncle")
         } else {
-          uncles.collectFirst {
-            case u if u == ib.id || ancestors.contains(u) => s"uncle $u is an element of the chain"
-            case u if alreadyMerged.contains(u) => s"uncle $u is merged by an earlier element"
-            case u if inputBlockRecords.get(u).exists(_.header.parentId != ib.header.parentId) =>
-              s"uncle $u belongs to another ordering block"
-            case u if inputBlockRecords.get(u).exists(r => !r.prevInputBlockId.forall(p => ancestors.contains(p))) =>
-              s"uncle $u is not a sibling of an element of the chain"
-          }
+          uncles.iterator
+            .flatMap(u => uncleRuleViolation(ib.header.parentId, ancestors, alreadyMerged, Some(ib.id), u))
+            .toSeq
+            .headOption
         }
       }
       structureError match {
@@ -859,22 +855,53 @@ trait InputBlocksProcessor extends ScorexLogging {
   }
 
   /**
+    * The uncle rule shared by validation (applyWithUncles) and the generator's candidates
+    * (mergeableUncleCandidates): `u` may be merged by a block (`blockId`, None for a block not built yet) of the
+    * ordering block `orderingId` whose ancestors (processed chain up to and including its parent) are `ancestors`,
+    * which merge `alreadyMerged`. Records unknown yet are not judged here (their availability is checked
+    * separately).
+    *
+    * @return why `u` can not be merged, None if it can
+    */
+  private def uncleRuleViolation(orderingId: ModifierId,
+                                 ancestors: Seq[ModifierId],
+                                 alreadyMerged: Set[ModifierId],
+                                 blockId: Option[ModifierId],
+                                 u: ModifierId): Option[String] = {
+    if (blockId.contains(u) || ancestors.contains(u)) {
+      Some(s"uncle $u is an element of the chain")
+    } else if (alreadyMerged.contains(u)) {
+      Some(s"uncle $u is merged by an earlier element")
+    } else {
+      inputBlockRecords.get(u) match {
+        case Some(r) if r.header.parentId != orderingId =>
+          Some(s"uncle $u belongs to another ordering block")
+        case Some(r) if !r.prevInputBlockId.forall(p => ancestors.contains(p)) =>
+          Some(s"uncle $u is not a sibling of an element of the chain")
+        case _ => None
+      }
+    }
+  }
+
+  /**
     * Collected transactions (L) of the input blocks given, in chain order: for each block, the deduplicated
     * transactions of its uncles (uncles enabled only), then its own transactions.
     *
-    * @param strict - if true, None is returned when some transactions are not available; otherwise such
-    *               transactions are skipped (as before uncles support)
+    * @return the transactions (missing ones skipped, as before uncles support), and the first reason found why
+    *         some are missing
     */
-  private def collectTransactions(ids: Seq[ModifierId], strict: Boolean): Option[Seq[ErgoTransaction]] = {
+  private def collectTransactionsChecked(ids: Seq[ModifierId]): (Seq[ErgoTransaction], Option[String]) = {
     val result = mutable.ArrayBuffer[ErgoTransaction]()
     val seen = mutable.HashSet[ModifierId]()
-    var complete = true
+    var problem: Option[String] = None
+    def missing(reason: => String): Unit = if (problem.isEmpty) problem = Some(reason)
     ids.foreach { id =>
       uncleIdsOf(id).foreach { u =>
         val uncleTxs = transactionsOf(u)
         if (uncleTxs.isEmpty) {
           log.warn(s"Transactions of uncle $u of input block $id are not available")
-          complete = false
+          missing(s"transaction list of uncle $u of path element $id is not available " +
+            s"(uncle record known: ${inputBlockRecords.contains(u)}, id list stored: ${inputBlockTransactions.contains(u)})")
         }
         result ++= uncleTxs.getOrElse(Seq.empty).filter(tx => seen.add(tx.id))
       }
@@ -888,25 +915,40 @@ trait InputBlocksProcessor extends ScorexLogging {
               seen += tx.id
             } else {
               log.warn(s"Transaction $tid not found in cache (expired or evicted)")
-              complete = false
+              missing(s"transaction $tid of path element $id is not in the transactions cache")
             }
           }
         case None =>
-          complete = false // skipped unless strict
+          missing(s"transaction id list of path element $id is not stored")
       }
     }
-    if (strict && !complete) None else Some(result)
+    (result, problem)
   }
 
-  /** Appends the deduplicated transactions of the uncles given, None if some of them are not available. */
+  /**
+    * Collected transactions (L) of the input blocks given, see collectTransactionsChecked.
+    *
+    * @param strict - if true, None is returned when some transactions are not available; otherwise such
+    *               transactions are skipped (as before uncles support)
+    */
+  private def collectTransactions(ids: Seq[ModifierId], strict: Boolean): Option[Seq[ErgoTransaction]] = {
+    val (txs, problem) = collectTransactionsChecked(ids)
+    if (strict && problem.isDefined) None else Some(txs)
+  }
+
+  /** Appends the deduplicated transactions of the uncles given, or tells which uncle's transactions are missing. */
   private def mergeUncleTransactions(prefix: Seq[ErgoTransaction],
-                                     uncles: Seq[ModifierId]): Option[Seq[ErgoTransaction]] = {
+                                     uncles: Seq[ModifierId]): Either[String, Seq[ErgoTransaction]] = {
     val seen = mutable.HashSet[ModifierId](prefix.map(_.id): _*)
-    uncles.foldLeft(Option(prefix)) { case (acc, u) =>
-      for {
-        collected <- acc
-        txs <- transactionsOf(u)
-      } yield collected ++ txs.filter(tx => seen.add(tx.id))
+    uncles.foldLeft[Either[String, Seq[ErgoTransaction]]](Right(prefix)) { case (acc, u) =>
+      acc.flatMap { collected =>
+        transactionsOf(u) match {
+          case Some(txs) => Right(collected ++ txs.filter(tx => seen.add(tx.id)))
+          case None =>
+            Left(s"transaction list of uncle $u is not available (uncle record known: ${inputBlockRecords.contains(u)}, " +
+              s"id list stored: ${inputBlockTransactions.contains(u)})")
+        }
+      }
     }
   }
 
@@ -934,19 +976,25 @@ trait InputBlocksProcessor extends ScorexLogging {
 
   /**
     * Input block ids from the first input block of the ordering block (child of `orderingParentId`) to `tip`,
-    * following parent links, None if some block is unknown or belongs to another ordering block.
+    * following parent links, or which link is missing or belongs to another ordering block.
     */
-  private def inputBlockPath(orderingParentId: ModifierId, tip: ModifierId): Option[Seq[ModifierId]] = {
+  private def inputBlockPath(orderingParentId: ModifierId, tip: ModifierId): Either[String, Seq[ModifierId]] = {
     val maxSteps = inputBlockRecords.size + 1
     @tailrec
-    def loop(id: ModifierId, acc: List[ModifierId], steps: Int): Option[List[ModifierId]] = {
+    def loop(id: ModifierId, acc: List[ModifierId], steps: Int): Either[String, List[ModifierId]] = {
+      val what = if (id == tip) s"linked input block $id" else s"path element $id (on the path to $tip)"
       inputBlockRecords.get(id) match {
-        case Some(r) if r.header.parentId == orderingParentId && steps < maxSteps =>
+        case None =>
+          Left(s"$what is not known (searched the input block tree of $orderingParentId)")
+        case Some(r) if r.header.parentId != orderingParentId =>
+          Left(s"$what belongs to the input block tree of ${r.header.parentId}, not of $orderingParentId")
+        case Some(_) if steps >= maxSteps =>
+          Left(s"path to $tip is longer than the known input blocks (a cycle?)")
+        case Some(r) =>
           r.prevInputBlockId match {
             case Some(parentId) => loop(parentId, id :: acc, steps + 1)
-            case None => Some(id :: acc)
+            case None => Right(id :: acc)
           }
-        case _ => None
       }
     }
     loop(tip, Nil, 0)
@@ -1557,7 +1605,20 @@ trait InputBlocksProcessor extends ScorexLogging {
   def getBestOrderingCollectedCost(): Long = inputBlocksTree().map(_.bestChainCost).getOrElse(0L)
 
   /**
-    * Uncle candidates for a child of the best input block (uncles enabled only): siblings recorded valid against
+    * Input block a new candidate builds on: with uncles enabled, the tip of the processed part of the best chain
+    * (the chain whose collected transactions and merged uncles the candidate's uncles and transactions are judged
+    * against, by the generator and by validation alike); otherwise the best input block, as before.
+    */
+  def candidateParentInputBlock(): Option[InputBlockAnnouncement] = {
+    if (inputBlockUnclesEnabled) {
+      inputBlocksTree().flatMap(_.bestChain.lastOption).flatMap(inputBlockRecords.get)
+    } else {
+      bestBlocks._2
+    }
+  }
+
+  /**
+    * Uncle candidates for a child of `candidateParentInputBlock()` (uncles enabled only): siblings recorded valid against
     * their own prefix, of the best ordering block, whose parent is an element of the best chain (or which have
     * no parent), which are neither elements of the chain nor merged by one, and whose transactions are
     * available. Oldest first: by the depth of the parent, then by timestamp. Whether a candidate conflicts
@@ -1569,7 +1630,7 @@ trait InputBlocksProcessor extends ScorexLogging {
     } else {
       bestOrderingBlock().flatMap(h => inputBlockTrees.get(h.id).map(h.id -> _)) match {
         case Some((orderingId, tree)) =>
-          val chainIds = tree.bestChain
+          val chainIds = tree.bestChain // the processed chain, ending with candidateParentInputBlock()
           if (chainIds.isEmpty) {
             Seq.empty
           } else {
@@ -1580,9 +1641,7 @@ trait InputBlocksProcessor extends ScorexLogging {
               .flatMap(id => inputBlockRecords.get(id))
               .filter { r =>
                 r.header.parentId == orderingId &&
-                  !inChain.contains(r.id) &&
-                  !merged.contains(r.id) &&
-                  r.prevInputBlockId.forall(p => inChain.contains(p)) &&
+                  uncleRuleViolation(orderingId, chainIds, merged, None, r.id).isEmpty &&
                   transactionsOf(r.id).isDefined
               }
               .sortBy(r => (r.prevInputBlockId.map(depth).getOrElse(-1), r.header.timestamp, r.id.toString))
@@ -1599,14 +1658,19 @@ trait InputBlocksProcessor extends ScorexLogging {
     * L(prevInputBlockId) followed by the deduplicated transactions of the uncles. Shared by the producer
     * (CandidateGenerator) and the receiver (ordering block reconstruction).
     *
-    * @return None if some input block or transaction is not available
+    * @return the transactions, or which input block, path element or uncle transaction list is not available
     */
   def collectedTransactionsFor(orderingParentId: ModifierId,
                                prevInputBlockId: Option[ModifierId],
-                               uncles: Seq[ModifierId]): Option[Seq[ErgoTransaction]] = {
+                               uncles: Seq[ModifierId]): Either[String, Seq[ErgoTransaction]] = {
+    val pathOrError: Either[String, Seq[ModifierId]] =
+      prevInputBlockId.map(inputBlockPath(orderingParentId, _)).getOrElse(Right(Seq.empty))
     for {
-      path <- prevInputBlockId.map(inputBlockPath(orderingParentId, _)).getOrElse(Some(Seq.empty))
-      collected <- collectTransactions(path, strict = true)
+      path <- pathOrError
+      collected <- {
+        val (txs, problem) = collectTransactionsChecked(path)
+        problem.map(p => Left(p): Either[String, Seq[ErgoTransaction]]).getOrElse(Right(txs))
+      }
       merged <- mergeUncleTransactions(collected, uncles)
     } yield merged
   }
@@ -1622,11 +1686,20 @@ trait InputBlocksProcessor extends ScorexLogging {
   def orderingBlockCollectedTransactions(orderingParentId: ModifierId,
                                          extensionFields: Seq[(Array[Byte], Array[Byte])]): Option[Seq[ErgoTransaction]] = {
     val prevOpt = extensionFields.find(_._1.sameElements(Extension.PrevInputBlockIdKey)).map(kv => bytesToId(kv._2))
-    val unclesOpt = extensionFields.find(_._1.sameElements(Extension.InputBlockUnclesKey)) match {
-      case Some(kv) => InputBlockUncles.parseFieldValue(kv._2)
-      case None => Some(Seq.empty)
+    orderingBlockCollected(orderingParentId, prevOpt, extensionFields).toOption
+  }
+
+  private def orderingBlockCollected(orderingParentId: ModifierId,
+                                     prevOpt: Option[ModifierId],
+                                     extensionFields: Seq[(Array[Byte], Array[Byte])]): Either[String, Seq[ErgoTransaction]] = {
+    extensionFields.find(_._1.sameElements(Extension.InputBlockUnclesKey)) match {
+      case Some(kv) =>
+        InputBlockUncles.parseFieldValue(kv._2) match {
+          case Some(uncles) => collectedTransactionsFor(orderingParentId, prevOpt, uncles)
+          case None => Left("malformed uncles field in the ordering block's extension")
+        }
+      case None => collectedTransactionsFor(orderingParentId, prevOpt, Seq.empty)
     }
-    unclesOpt.flatMap(uncles => collectedTransactionsFor(orderingParentId, prevOpt, uncles))
   }
 
   /**
@@ -1637,23 +1710,24 @@ trait InputBlocksProcessor extends ScorexLogging {
     */
   def rebuildOrderingBlockTransactions(header: Header,
                                        extensionFields: Seq[(Array[Byte], Array[Byte])],
-                                       ownTransactions: Seq[ErgoTransaction]): Either[String, Seq[ErgoTransaction]] = {
-    orderingBlockCollectedTransactions(header.parentId, extensionFields) match {
-      case None =>
-        Left(s"input blocks or transactions linked by ordering block ${header.id} are not available")
-      case Some(collected) =>
+                                       ownTransactions: Seq[ErgoTransaction]): Either[RebuildFailure, Seq[ErgoTransaction]] = {
+    val prevOpt = extensionFields.find(_._1.sameElements(Extension.PrevInputBlockIdKey)).map(kv => bytesToId(kv._2))
+    orderingBlockCollected(header.parentId, prevOpt, extensionFields) match {
+      case Left(reason) =>
+        Left(InputBlocksMissing(s"input blocks or transactions linked by ordering block ${header.id} are not available: " +
+          s"$reason (linked input block $prevOpt, tree of ${header.parentId})"))
+      case Right(collected) =>
         val txs = collected ++ ownTransactions
         val root = BlockTransactions.transactionsRoot(txs, header.version)
         if (root.sameElements(header.transactionsRoot)) {
           Right(txs)
         } else {
-          val linked = extensionFields.find(_._1.sameElements(Extension.PrevInputBlockIdKey)).map(kv => bytesToId(kv._2))
           val uncles = InputBlockUncles.fromExtensionFields(extensionFields).getOrElse(Seq.empty)
-          Left(s"Merkle root of rebuilt transactions does not match ordering block ${header.id} " +
-            s"(version ${header.version}, parent ${header.parentId}, linked input block $linked, uncles $uncles): " +
+          Left(RootMismatch(s"Merkle root of rebuilt transactions does not match ordering block ${header.id} " +
+            s"(version ${header.version}, parent ${header.parentId}, linked input block $prevOpt, uncles $uncles): " +
             s"rebuilt ${collected.length} collected [${collected.map(_.id).mkString(", ")}] and ${ownTransactions.length} " +
             s"own [${ownTransactions.map(_.id).mkString(", ")}], root ${Algos.encode(root)}, " +
-            s"header root ${Algos.encode(header.transactionsRoot)}")
+            s"header root ${Algos.encode(header.transactionsRoot)}"))
         }
     }
   }
@@ -1661,6 +1735,17 @@ trait InputBlocksProcessor extends ScorexLogging {
 }
 
 object InputBlocksProcessor {
+
+  /** Why an ordering block's transactions could not be rebuilt from input blocks */
+  sealed trait RebuildFailure {
+    def reason: String
+  }
+
+  /** An input block, path element or uncle transaction list is not available (yet) */
+  case class InputBlocksMissing(reason: String) extends RebuildFailure
+
+  /** Rebuilt, but the transactions root does not match the header's */
+  case class RootMismatch(reason: String) extends RebuildFailure
 
   /** Validation of an input block can not complete yet as some of its uncles or their transactions are unknown */
   class UnclesNotAvailable(val ids: Seq[ModifierId])
