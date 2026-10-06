@@ -383,7 +383,7 @@ Both failures were in the fixture, not in the production path, and not a timing 
   - `genesisWithTransactions` splits the largest anyone-can-spend output of a random genesis block. When that box
     carried tokens, A's transaction created them twice, and the input block was rightly rejected.
   - The other boxes the specs use carry no tokens, so only these fixtures were affected, at random.
-  - The round-2 fixture (`orderingBlockOverInputBlocks`) picks its box the same way, so it had the same exposure.
+  - The round 2 fixture (`orderingBlockOverInputBlocks`) picks its box the same way, so it had the same exposure.
 - **Fix:**
   - `split` now puts the tokens on its first output only.
   - Both view-holder fixtures prefer a box without tokens.
