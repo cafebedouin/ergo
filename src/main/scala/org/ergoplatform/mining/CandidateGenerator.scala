@@ -177,12 +177,20 @@ class CandidateGenerator(
       // the solved block is cleared whether or not a new candidate is needed: a candidate request processed after
       // the block was applied and before this event has already put the cached candidate on the new block
       val solvedBlockAfter = if (needNewSolution(state.solvedBlock, header.id)) None else state.solvedBlock
-      val stateWithAppliedTxs =
-        state.copy(lastAppliedBlockTxs = Some(header.id -> applied.txIds.toSet), solvedBlock = solvedBlockAfter)
+      // likewise a previous candidate not built on the applied block: a solution for it would be a sibling of that block
+      val previousCandidateAfter = state.cachedPreviousCandidate.filterNot(c => needNewCandidate(Some(c), header))
+      val stateWithAppliedTxs = state.copy(
+        lastAppliedBlockTxs = Some(header.id -> applied.txIds.toSet),
+        solvedBlock = solvedBlockAfter,
+        cachedPreviousCandidate = previousCandidateAfter
+      )
       if (needNewCandidate(state.cachedCandidate, header)) {
         context.become(initialized(stateWithAppliedTxs.copy(cachedCandidate = None, cachedPreviousCandidate = None)))
         self ! GenerateCandidate(txsToInclude = Seq.empty, reply = false, forced = false)
       } else {
+        if (state.solvedBlock.isDefined && solvedBlockAfter.isEmpty) {
+          log.info(s"Candidate already on applied block ${header.id}, released solved block ${state.solvedBlock.map(_.id)}")
+        }
         context.become(initialized(stateWithAppliedTxs))
       }
 
