@@ -1943,4 +1943,110 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
       system.terminate()
     }
 
+  /** Fresh node and generator, with a test PoW scheme that can reject one solution on one parent. */
+  private class SiblingFixture(name: String)(implicit system: ActorSystem) {
+    val testProbe = new TestProbe(system)
+    system.eventStream.subscribe(testProbe.ref, newBlockSignal)
+    val powScheme = new SolutionRejectingPowScheme(
+      defaultSettings.chainSettings.powScheme.k,
+      defaultSettings.chainSettings.powScheme.n
+    )
+    val settings: ErgoSettings = defaultSettings.copy(
+      directory     = s"${defaultSettings.directory}-$name-${System.currentTimeMillis()}",
+      chainSettings = defaultSettings.chainSettings.copy(powScheme = powScheme)
+    )
+    val viewHolderRef: ActorRef    = ErgoNodeViewRef(settings)
+    val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+    val candidateGenerator: ActorRef =
+      CandidateGenerator(defaultMinerSecret.publicImage, readersHolderRef, viewHolderRef, settings)
+    val otherPk: ProveDlog =
+      DLogProverInput(BigIntegers.fromUnsignedByteArray("another_test_key".getBytes())).publicImage
+
+    def candidate(optPk: Option[ProveDlog]): Candidate = {
+      candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false, optPk = optPk), testProbe.ref)
+      testProbe.fishForMessage(newBlockDelay) { case StatusReply.Success(_: Candidate) => true; case _ => false } match {
+        case StatusReply.Success(c: Candidate) => c
+      }
+    }
+    def solve(c: Candidate): ErgoFullBlock =
+      settings.chainSettings.powScheme.proveCandidate(c.candidateBlock, defaultMinerSecret.w, 0, 1000).get
+    // fake PoW always finds nonce 0; another solution for the same candidate needs another nonce
+    def solveAt(c: Candidate, nonce: Long): ErgoFullBlock = {
+      val sol = solve(c).header.powSolution
+      CandidateGenerator.completeBlock(c.candidateBlock, sol.copy(n = Longs.toByteArray(nonce)))
+    }
+    def applyDirectly(block: ErgoFullBlock): Unit = {
+      viewHolderRef ! LocallyGeneratedModifier(block.header)
+      block.mandatoryBlockSections.foreach(viewHolderRef ! LocallyGeneratedModifier(_))
+      testProbe.fishForMessage(newBlockDelay) { case FullBlockApplied(h) => h.id == block.id; case _ => false }
+    }
+
+    /** A late solution for `stale` (whose parent is not `appliedId`) is turned away, the sibling it would make is never
+      * stored, and a candidate on `appliedId` still takes the next solution. */
+    def lateSolutionIsRejected(stale: Candidate, appliedId: scorex.util.ModifierId): Unit = {
+      val sibling = solveAt(stale, 1)
+      sibling.parentId should not be appliedId
+      // under real PoW a solution for another candidate fails on the current one; the test scheme does that here
+      powScheme.rejected = Some(appliedId -> sibling.header.powSolution)
+      candidateGenerator.tell(sibling.header.powSolution, testProbe.ref)
+      testProbe.fishForMessage(blockValidationDelay) {
+        case StatusReply.Error(_)    => true
+        case StatusReply.Success(()) => fail("a late solution for a candidate on the applied block's parent was accepted")
+        case _                       => false
+      }
+      // the default key, as the solution carries the default miner pk
+      val next = solve(candidate(None))
+      next.parentId shouldBe appliedId
+      candidateGenerator.tell(next.header.powSolution, testProbe.ref)
+      testProbe.fishForMessage(blockValidationDelay) {
+        case StatusReply.Success(()) => true
+        case StatusReply.Error(e)    => fail(s"next solution rejected: ${e.getMessage}")
+        case _                       => false
+      }
+      testProbe.fishForMessage(newBlockDelay) { case FullBlockApplied(h) => h.id == next.id; case _ => false }
+      await((readersHolderRef ? GetReaders).mapTo[Readers]).h.contains(sibling.id) shouldBe false
+    }
+  }
+
+  it should "not mine a sibling from the previous candidate after a regeneration on a peer's block, before its event" in
+    new TestKit(ActorSystem()) {
+      val f = new SiblingFixture("no-sibling-peer")
+      import f._
+      val first = candidate(None)
+      system.eventStream.unsubscribe(candidateGenerator, classOf[FullBlockApplied])
+      // a peer's block on the same parent reaches the node; the generator has not seen its event yet
+      val peerBlock = solve(first)
+      applyDirectly(peerBlock)
+      candidate(Some(otherPk)).candidateBlock.parentOpt.map(_.id) shouldBe Some(peerBlock.id)
+      lateSolutionIsRejected(first, peerBlock.id)
+      system.terminate()
+    }
+
+  it should "not mine a sibling from the previous candidate after a regeneration on its own block, at its event" in
+    new TestKit(ActorSystem()) {
+      val f = new SiblingFixture("no-sibling-own")
+      import f._
+      val first = candidate(None)
+      system.eventStream.unsubscribe(candidateGenerator, classOf[FullBlockApplied])
+      val solved = solve(first)
+      candidateGenerator.tell(solved.header.powSolution, testProbe.ref)
+      testProbe.fishForMessage(newBlockDelay) { case FullBlockApplied(h) => h.id == solved.id; case _ => false }
+      candidate(Some(otherPk)).candidateBlock.parentOpt.map(_.id) shouldBe Some(solved.id)
+      candidateGenerator ! LocalBlockApplied(solved.header, solved.blockTransactions.transactions.map(_.id))
+      lateSolutionIsRejected(first, solved.id)
+      system.terminate()
+    }
+
+}
+
+/** Fake PoW that also rejects one solution on one parent (`rejected`), and accepts every other header. */
+class SolutionRejectingPowScheme(k: Int, n: Int) extends DefaultFakePowScheme(k, n) {
+  @volatile var rejected: Option[(scorex.util.ModifierId, AutolykosSolution)] = None
+
+  override def validate(header: Header): Try[Unit] =
+    if (rejected.exists { case (parentId, s) => header.parentId == parentId && java.util.Arrays.equals(header.powSolution.n, s.n) }) {
+      Failure(new Exception("solution rejected by the test PoW scheme"))
+    } else {
+      super.validate(header)
+    }
 }
