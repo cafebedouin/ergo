@@ -1,0 +1,34 @@
+name: diag-replay
+# Replays the witness runs a review or PR text cites: diag/replay.sh lists the steps (green runs, reds with old code or a
+# mutation), each with its expected outcome; the job fails if any step's outcome differs. Pushes to diag/replay-* only.
+on:
+  push:
+    branches: [ 'diag/replay-*' ]
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Replay
+        run: bash diag/replay.sh
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-${{ github.run_id }}
+          path: diag/out/
+          if-no-files-found: warn
+          retention-days: 30
