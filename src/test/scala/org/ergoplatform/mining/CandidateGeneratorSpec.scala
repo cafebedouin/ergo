@@ -5,6 +5,7 @@ import akka.pattern.{StatusReply, ask}
 import akka.testkit.{TestKit, TestProbe}
 import akka.util.Timeout
 import org.bouncycastle.util.BigIntegers
+import com.google.common.primitives.Longs
 import org.ergoplatform.mining.CandidateGenerator.{Candidate, GenerateCandidate}
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.history.BlockTransactions
@@ -1615,4 +1616,154 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
       system.terminate()
     }
 
+  it should "not mine a sibling of the applied block from the previous candidate after a regeneration on it" in
+    new TestKit(ActorSystem()) {
+      val testProbe = new TestProbe(system)
+      system.eventStream.subscribe(testProbe.ref, newBlockSignal)
+
+      // fake PoW accepts every header; this one rejects a single solution on a single parent, so that solution fails
+      // on the current candidate and reaches the fallback to the previous one, as a stale solution does under real PoW
+      val powScheme = new SolutionRejectingPowScheme(
+        defaultSettings.chainSettings.powScheme.k,
+        defaultSettings.chainSettings.powScheme.n
+      )
+      val settings: ErgoSettings = defaultSettings.copy(
+        directory     = s"${defaultSettings.directory}-no-sibling-${System.currentTimeMillis()}",
+        chainSettings = defaultSettings.chainSettings.copy(powScheme = powScheme)
+      )
+      val viewHolderRef: ActorRef    = ErgoNodeViewRef(settings)
+      val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+      val candidateGenerator: ActorRef =
+        CandidateGenerator(defaultMinerSecret.publicImage, readersHolderRef, viewHolderRef, settings)
+
+      def candidate(optPk: Option[ProveDlog]): Candidate = {
+        candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false, optPk = optPk), testProbe.ref)
+        testProbe.fishForMessage(newBlockDelay) { case StatusReply.Success(_: Candidate) => true; case _ => false } match {
+          case StatusReply.Success(c: Candidate) => c
+        }
+      }
+      def solve(c: Candidate): ErgoFullBlock =
+        settings.chainSettings.powScheme.proveCandidate(c.candidateBlock, defaultMinerSecret.w, 0, 1000).get
+      // fake PoW always finds nonce 0; another solution for the same candidate needs another nonce
+      def solveAt(c: Candidate, nonce: Long): ErgoFullBlock = {
+        val s = solve(c).header.powSolution
+        CandidateGenerator.completeBlock(c.candidateBlock, s.copy(n = Longs.toByteArray(nonce)))
+      }
+
+      // one block first, so that the race below is not on the genesis block
+      val genesis = solve(candidate(None))
+      candidateGenerator.tell(genesis.header.powSolution, testProbe.ref)
+      testProbe.fishForMessage(newBlockDelay) { case FullBlockApplied(h) => h.id == genesis.id; case _ => false }
+      val first = eventually(timeout(candidateGenDelay), interval(100.millis)) {
+        val c = candidate(None)
+        c.candidateBlock.parentOpt.map(_.id) shouldBe Some(genesis.id)
+        c
+      }
+
+      // the same ordering as the case above: the cache is regenerated on the solved block before its block-applied
+      // event, so the previous candidate is the one the block was solved from
+      system.eventStream.unsubscribe(candidateGenerator, classOf[FullBlockApplied])
+      val solved = solve(first)
+      candidateGenerator.tell(solved.header.powSolution, testProbe.ref)
+      testProbe.fishForMessage(newBlockDelay) { case FullBlockApplied(h) => h.id == solved.id; case _ => false }
+      val otherPk = DLogProverInput(BigIntegers.fromUnsignedByteArray("another_test_key".getBytes())).publicImage
+      candidate(Some(otherPk)).candidateBlock.parentOpt.map(_.id) shouldBe Some(solved.id)
+      candidateGenerator ! LocalBlockApplied(solved.header, solved.blockTransactions.transactions.map(_.id))
+
+      // a late solution for the first candidate: on the current candidate it fails, on the first it is a sibling
+      val sibling = solveAt(first, 1)
+      sibling.id should not be solved.id
+      sibling.parentId shouldBe solved.parentId
+      powScheme.rejected = Some(solved.id -> sibling.header.powSolution)
+      candidateGenerator.tell(sibling.header.powSolution, testProbe.ref)
+      testProbe.receiveWhile(blockValidationDelay) { case m => m }.foreach {
+        case StatusReply.Success(()) => fail("a late solution for the solved block's parent was accepted")
+        case _                       =>
+      }
+
+      // the next solution on the applied block is accepted, and the sibling was never mined
+      val nextSolved = solve(candidate(None))
+      nextSolved.parentId shouldBe solved.id
+      candidateGenerator.tell(nextSolved.header.powSolution, testProbe.ref)
+      testProbe.fishForMessage(blockValidationDelay) {
+        case StatusReply.Success(()) => true
+        case StatusReply.Error(e)    => fail(s"next solution rejected: ${e.getMessage}")
+        case _                       => false
+      }
+      testProbe.fishForMessage(newBlockDelay) { case FullBlockApplied(h) => h.id == nextSolved.id; case _ => false }
+      await((readersHolderRef ? GetReaders).mapTo[Readers]).h.contains(sibling.id) shouldBe false
+      system.terminate()
+    }
+
+  it should "keep the solved block when the block-applied event that arrives is for its parent" in
+    new TestKit(ActorSystem()) {
+      val testProbe = new TestProbe(system)
+      system.eventStream.subscribe(testProbe.ref, newBlockSignal)
+
+      val settings: ErgoSettings =
+        defaultSettings.copy(directory = s"${defaultSettings.directory}-solved-keep-${System.currentTimeMillis()}")
+      val viewHolderRef: ActorRef    = ErgoNodeViewRef(settings)
+      val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+      val candidateGenerator: ActorRef =
+        CandidateGenerator(defaultMinerSecret.publicImage, readersHolderRef, viewHolderRef, settings)
+
+      def candidate(optPk: Option[ProveDlog]): Candidate = {
+        candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false, optPk = optPk), testProbe.ref)
+        testProbe.fishForMessage(newBlockDelay) { case StatusReply.Success(_: Candidate) => true; case _ => false } match {
+          case StatusReply.Success(c: Candidate) => c
+        }
+      }
+      def solve(c: Candidate): ErgoFullBlock =
+        settings.chainSettings.powScheme.proveCandidate(c.candidateBlock, defaultMinerSecret.w, 0, 1000).get
+      // fake PoW always finds nonce 0; another solution for the same candidate needs another nonce
+      def solveAt(c: Candidate, nonce: Long): ErgoFullBlock = {
+        val s = solve(c).header.powSolution
+        CandidateGenerator.completeBlock(c.candidateBlock, s.copy(n = Longs.toByteArray(nonce)))
+      }
+
+      // the parent is not mined by this generator (a block from a peer): it goes to the node view directly
+      val first = candidate(None)
+      system.eventStream.unsubscribe(candidateGenerator, classOf[FullBlockApplied])
+      val parent = solve(first)
+      viewHolderRef ! LocallyGeneratedModifier(parent.header)
+      parent.mandatoryBlockSections.foreach(viewHolderRef ! LocallyGeneratedModifier(_))
+      testProbe.fishForMessage(newBlockDelay) { case FullBlockApplied(h) => h.id == parent.id; case _ => false }
+
+      // a candidate on the new block is generated, and solved, before the generator sees that block's applied event
+      val otherPk = DLogProverInput(BigIntegers.fromUnsignedByteArray("another_test_key".getBytes())).publicImage
+      val onParent = candidate(Some(otherPk))
+      onParent.candidateBlock.parentOpt.map(_.id) shouldBe Some(parent.id)
+      val solved = solve(onParent)
+      candidateGenerator.tell(solved.header.powSolution, testProbe.ref)
+      testProbe.fishForMessage(blockValidationDelay) {
+        case StatusReply.Success(()) => true
+        case StatusReply.Error(e)    => fail(s"solution rejected: ${e.getMessage}")
+        case _                       => false
+      }
+
+      // the parent's applied event arrives now: the solved block's parent is the applied block, so it stays solved
+      candidateGenerator ! LocalBlockApplied(parent.header, parent.blockTransactions.transactions.map(_.id))
+      val second = solveAt(onParent, 1)
+      second.id should not be solved.id
+      candidateGenerator.tell(second.header.powSolution, testProbe.ref)
+      testProbe.fishForMessage(blockValidationDelay) {
+        case StatusReply.Error(e)    => e.getMessage should include("Block already solved"); true
+        case StatusReply.Success(()) => fail("a second solution at the solved block's height was accepted")
+        case _                       => false
+      }
+      system.terminate()
+    }
+
+}
+
+/** Fake PoW that also rejects one solution on one parent (`rejected`), and accepts every other header. */
+class SolutionRejectingPowScheme(k: Int, n: Int) extends DefaultFakePowScheme(k, n) {
+  @volatile var rejected: Option[(scorex.util.ModifierId, AutolykosSolution)] = None
+
+  override def validate(header: Header): Try[Unit] =
+    if (rejected.exists { case (parentId, s) => header.parentId == parentId && java.util.Arrays.equals(header.powSolution.n, s.n) }) {
+      Failure(new Exception("solution rejected by the test PoW scheme"))
+    } else {
+      super.validate(header)
+    }
 }
