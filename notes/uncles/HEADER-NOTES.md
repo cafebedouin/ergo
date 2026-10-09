@@ -15,7 +15,7 @@ repeats, existing specs match the baseline, and a mutation crediting nothing tur
 properties red. Round 3 was verified on GitHub and rechecked on the network (18 runs). Round 4 was verified on GitHub (compiled with no fixes, new specs green, no regression, each change killed by
 a mutant). Round 5 likewise (zero compile fixes, specs green over 2 repeats, no regression, each fix killed by
 its mutant). **Rounds 2 to 6 (see the end of this
-file) were not compiled or run here either; round 4 in particular is uncompiled.**
+file) were not compiled or run here either; round 6 has not been compiled anywhere yet.**
 
 **Round 1 was written without compiling or running anything here.** The session had no sbt, and Maven Central was blocked
 by the network proxy (HTTP 403). The code was written by reading the surrounding types.
