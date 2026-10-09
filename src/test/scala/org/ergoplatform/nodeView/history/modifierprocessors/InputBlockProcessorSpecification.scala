@@ -468,6 +468,33 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
     }
   }
 
+  property("fork-switch completion propagates every processed shared block to every waiting fork") {
+    withInputBlockFixture { (us, h, orderingParent, _) =>
+      def ibOf(parent: InputBlockAnnouncement): InputBlockAnnouncement =
+        InputBlockAnnouncement(1, nextInputHeader(h, us, orderingParent), parentOnly(idToBytes(parent.id)), None)
+      val root = InputBlockAnnouncement(1, nextInputHeader(h, us, orderingParent), InputBlockFields.empty, None)
+      val x = ibOf(root)
+      Seq(root, x).foreach(h.applyInputBlock(_) shouldBe None)
+      h.applyInputBlockTransactions(root.id, Seq.empty, us) shouldBe (Seq(root.id) -> Seq.empty)
+      h.applyInputBlockTransactions(x.id, Seq.empty, us) shouldBe (Seq(x.id) -> Seq.empty)
+
+      val s1 = ibOf(root)
+      val s2 = ibOf(s1)
+      val c = ibOf(s2)
+      val c2 = ibOf(c)
+      val d = ibOf(s2)
+      Seq(s1, s2, c, c2, d).foreach(h.applyInputBlock(_) shouldBe None)
+      h.inputBlocksTree().get.forks.map(_.chain) shouldBe
+        Seq(Seq(root.id, x.id), Seq(root.id, s1.id, s2.id, c.id, c2.id), Seq(root.id, s1.id, s2.id, d.id))
+
+      h.applyInputBlockTransactions(c.id, Seq.empty, us) shouldBe (Seq.empty -> Seq.empty)
+      h.applyInputBlockTransactions(s1.id, Seq.empty, us) shouldBe (Seq.empty -> Seq.empty)
+      // switch to the longer fork: applicationStep processes s1, s2 and c; d's fork shares s1 and s2
+      h.applyInputBlockTransactions(s2.id, Seq.empty, us) shouldBe (Seq(s1.id, s2.id, c.id) -> Seq(x.id))
+      h.inputBlocksTree().get.forks.map(_.processedIndex) shouldBe Seq(1, 3, 2)
+    }
+  }
+
   property("create separate sibling forks for descendants of the same parent") {
     withInputBlockFixture { (us, h, orderingParent, _) =>
     val rootIb = InputBlockAnnouncement(1, nextInputHeader(h, us, orderingParent), InputBlockFields.empty, None)
