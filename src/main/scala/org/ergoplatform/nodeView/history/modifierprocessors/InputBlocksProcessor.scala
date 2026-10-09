@@ -1464,9 +1464,10 @@ trait InputBlocksProcessor extends ScorexLogging {
   }
 
   /**
-    * Uncles enabled only: known ancestors of an input block, nearest first, stored without a body (siblings whose
-    * transactions were not fetched), up to the first one with a body. Their bodies are fetched when a block
-    * building on them arrives.
+    * Uncles enabled only: all known ancestors of an input block (same ordering block), nearest first, stored
+    * without a body (siblings whose transactions were not fetched, or whose fetch was lost). The walk goes past
+    * ancestors that have their body, so a body lost behind a later block with its body is found again. Their bodies
+    * are fetched when a block building on them arrives.
     */
   def bodilessAncestors(ib: InputBlockAnnouncement): Seq[InputBlockAnnouncement] = {
     if (!inputBlockUnclesEnabled) {
@@ -1476,9 +1477,9 @@ trait InputBlocksProcessor extends ScorexLogging {
       @tailrec
       def loop(prevOpt: Option[ModifierId], acc: List[InputBlockAnnouncement], steps: Int): List[InputBlockAnnouncement] = {
         prevOpt.flatMap(inputBlockRecords.get) match {
-          case Some(parent) if parent.header.parentId == ib.header.parentId && steps < maxSteps &&
-            !inputBlockTransactions.contains(parent.id) =>
-            loop(parent.prevInputBlockId, parent :: acc, steps + 1)
+          case Some(parent) if parent.header.parentId == ib.header.parentId && steps < maxSteps =>
+            val withParent = if (inputBlockTransactions.contains(parent.id)) acc else parent :: acc
+            loop(parent.prevInputBlockId, withParent, steps + 1)
           case _ => acc.reverse
         }
       }
