@@ -426,6 +426,48 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
     }
   }
 
+  // Two forks share root -> s1 -> s2 and then diverge (a vs b). The shared blocks' transactions arrive
+  // child-first, so the root's arrival makes applicationStep process root, s1 and s2 in one call.
+  private def sharedPrefixForks(h: ErgoHistory, us: UtxoState, orderingParent: Header) = {
+    def ibOf(parent: Option[InputBlockAnnouncement]): InputBlockAnnouncement =
+      InputBlockAnnouncement(1, nextInputHeader(h, us, orderingParent),
+        parent.map(p => parentOnly(idToBytes(p.id))).getOrElse(InputBlockFields.empty), None)
+    val root = ibOf(None)
+    val s1 = ibOf(Some(root))
+    val s2 = ibOf(Some(s1))
+    val a = ibOf(Some(s2))
+    val b = ibOf(Some(s2))
+    Seq(root, s1, s2, a, b).foreach(h.applyInputBlock(_) shouldBe None)
+    h.inputBlocksTree().get.forks.map(_.chain) shouldBe
+      Seq(Seq(root.id, s1.id, s2.id, a.id), Seq(root.id, s1.id, s2.id, b.id))
+
+    h.applyInputBlockTransactions(s1.id, Seq.empty, us) shouldBe (Seq.empty -> Seq.empty)
+    h.applyInputBlockTransactions(s2.id, Seq.empty, us) shouldBe (Seq.empty -> Seq.empty)
+    h.applyInputBlockTransactions(root.id, Seq.empty, us) shouldBe (Seq(root.id, s1.id, s2.id) -> Seq.empty)
+    (root, s1, s2, a, b, ibOf _)
+  }
+
+  property("completion chain propagates every processed shared block to every waiting fork") {
+    withInputBlockFixture { (us, h, orderingParent, _) =>
+      sharedPrefixForks(h, us, orderingParent)
+      // both forks contain root, s1 and s2, all three processed
+      h.inputBlocksTree().get.forks.map(_.processedIndex) shouldBe Seq(2, 2)
+    }
+  }
+
+  property("switching to a fork that shared a multi-block completion rolls back only the divergent blocks") {
+    withInputBlockFixture { (us, h, orderingParent, _) =>
+      val (root, s1, s2, a, b, ibOf) = sharedPrefixForks(h, us, orderingParent)
+      h.applyInputBlockTransactions(a.id, Seq.empty, us) shouldBe (Seq(a.id) -> Seq.empty)
+      val b2 = ibOf(Some(b))
+      h.applyInputBlock(b2) shouldBe None
+      h.applyInputBlockTransactions(b.id, Seq.empty, us) shouldBe (Seq.empty -> Seq.empty)
+      // b's fork is now longer: switch from a to b. Only a is off the new best chain.
+      h.applyInputBlockTransactions(b2.id, Seq.empty, us) shouldBe (Seq(b.id, b2.id) -> Seq(a.id))
+      h.bestInputBlocksChain() shouldBe Seq(b2.id, b.id, s2.id, s1.id, root.id)
+    }
+  }
+
   property("create separate sibling forks for descendants of the same parent") {
     withInputBlockFixture { (us, h, orderingParent, _) =>
     val rootIb = InputBlockAnnouncement(1, nextInputHeader(h, us, orderingParent), InputBlockFields.empty, None)
