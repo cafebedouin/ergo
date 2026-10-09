@@ -10,7 +10,11 @@ credited or not. Everything is behind the existing node setting `ergo.node.input
 
 ## Build and test status
 
-**Nothing on this branch was compiled and no test was run.** The session had no sbt, and Maven Central was blocked
+**Round 1 (7ad049247), verified by the maintainer on GitHub:** compiles as written, all new specs green over 2
+repeats, existing specs match the baseline, and a mutation crediting nothing turns all 9 credit-asserting
+properties red. **Round 2 (see the end of this file) was not compiled or run here either.**
+
+**Round 1 was written without compiling or running anything here.** The session had no sbt, and Maven Central was blocked
 by the network proxy (HTTP 403). The code was written by reading the surrounding types.
 - The kept ergo-core code is the starting branch's, which the maintainer compiled and ran.
 - New code avoids unused imports, locals and pattern variables, because sbt-tpolecat makes warnings fatal.
@@ -113,7 +117,8 @@ For comparison, the starting branch (8a5b9f25c) was 20 files, +2044 / −108 aga
    information both readings give each uncle at most one credit on a chain.
 3. **Non-strict.** Nothing a validator computes about state, L or fork choice reads the field or the credit.
    - The credit map is written only in `applyInputBlock`, after the block is stored and inserted in the tree,
-     exactly as on the base.
+     exactly as on the base. Since round 2 the refresh runs in its own `Try`: a failure is logged and the
+     parent request (`toDownload`) is returned as computed, so credit can never affect block handling.
    - A missing field, a stripped field, a malformed field or a failing reference leaves the block's processing
      untouched. It only means no credit (or less) for that block.
    - Version 1 announcements and blocks without the field are accepted exactly as on the base.
@@ -260,7 +265,7 @@ For comparison, the starting branch (8a5b9f25c) was 20 files, +2044 / −108 aga
 | mixed | `InputBlockUnclesSpecification`: "version 1 announcements … accepted"; `CandidateGeneratorUnclesSpec`: "mixed: a flag-on node accepts a flag-off node's input blocks", "mixed: a flag-off node parses, ignores and relays unchanged…" |
 | L with uncles == L without | `InputBlockUnclesSpecification`: "L of a block with uncles equals L of the same block without them" (+ the first property checks L excludes the sibling's transaction) |
 | sibling announcement relay | `ErgoNodeViewHolderUnclesSpec`; `ErgoNodeViewSynchronizerSpecification`: "NewInputBlockSibling announces the sibling's id only" |
-| REST field | `BlocksApiRouteSpec`: "report credited uncles…" |
+| REST field | `BlocksApiRouteSpec`: "report credited uncles…" (shape, flag on/off), "report a credited uncle in /blocks/bestInputChain and /blocks/bestInputBlock" (value, round 2) |
 
 Each would fail without its code: the processor, generator and view-holder specs call methods that do not exist
 on the base (`getCreditedUncles`, `uncleCandidates`, `isSiblingAnnouncement`, `fieldViolation`,
@@ -276,22 +281,25 @@ processed. This is base fork handling, unchanged here.
 
 1. **The reward question** (why this branch exists): should credited sibling work count, and how much? This
    branch only records and exposes credit. It does not pay anything.
-2. **Credit is local accounting.** Two nodes can disagree:
+2. **Credit is local accounting** (confirmed by the maintainer against the code). Two nodes can disagree:
    - when one has not seen a sibling;
    - when one received a stripped copy first. The full copy is then ignored as "already known", as on the base,
-     so that node never credits that block. Keeping the better copy's field would fix it, at the cost of
+     so that node **permanently** loses the credit for that block. Keeping the better copy's field would fix it, at the cost of
      replacing stored announcements.
    Using credit for rewards needs a deterministic source, for example the ordering block committing to the
    credited set, or uncles being validated at ordering-block time.
 3. **"PoW-valid" means "known".** The synchronizer checks input-block PoW before storing an announcement only when
-   it has a UTXO state reader (`usrOpt.map(...).getOrElse(true)`), so a digest-mode node stores unchecked ones.
-   The processor could re-check PoW with the parameters, which it does not have today.
+   it has a UTXO state reader (`usrOpt.map(...).getOrElse(true)`). The maintainer confirmed this is narrower
+   than first stated: input blocks, and so the sibling relay too, go only to UTXO-mode peers
+   (`inputBlockRecipients`), so the unchecked path concerns little beyond a digest-mode node that obtains an
+   announcement anyway. The processor could re-check PoW with the parameters, which it does not have today.
 4. **Fetching unknown uncles.** The starting branch downloaded unknown uncles' announcements. This branch does
    not: credit is re-evaluated when the announcement arrives through normal relay. Requesting a missing
    referenced announcement (announcement only) would make credit converge faster.
-5. **Relay gap.** The first child of a parent is relayed only if it becomes the best input block, through the
-   base path. A first child whose transactions never arrive, so that it never becomes best, is not relayed as a
-   sibling. Later competitors are relayed.
+5. **Relay gap** (confirmed by the maintainer). The first child of a parent is relayed only if it becomes the best
+   input block, through the base path. A first child whose transactions never arrive, so that it never becomes
+   best, is not relayed as a sibling. Later competitors are relayed. "First" is per node: it depends on the
+   order in which that node received the announcements.
 6. **Uncle depth** is bounded only by the ordering block: an uncle's parent may be any ancestor. Ethereum bounds
    it (6 generations). Whether a bound is wanted depends on the reward answer.
 7. **The base receive path** fetches sibling transactions on announcement (see deviations). Whether siblings
@@ -300,3 +308,30 @@ processed. This is base fork handling, unchanged here.
    recompute only the blocks whose chain contains the new announcement's parent, or which reference it.
 9. `InputBlocksProcessor.scala` was already over the 800-line style limit on the base (1269 lines). It is now
    about 1460 lines. Moving the credit code into its own trait would be a follow-up.
+
+## Round 2
+
+Two requests from the round 1 review, no design change:
+
+1. **`BlocksApiRouteSpec` checks a value, not only the shape.** New property "report a credited uncle in
+   /blocks/bestInputChain and /blocks/bestInputBlock".
+   - It builds a flag-on history: chain A, B, sibling S (child of A), and C (child of B) referencing S, using
+     `InputBlockUnclesTestHelpers`.
+   - It serves that history to the route through a small readers actor answering `GetDataFromHistory`.
+   - It asserts that `creditedUncles` in `bestInputChain` maps C to `[S]` and B to `[]`, and that
+     `bestInputBlock` reports C with `creditedUncles` `[S]`.
+2. **The credit refresh can no longer affect block handling.** In `InputBlocksProcessor.applyInputBlock`,
+   `toDownload` (the parent request) is computed as before. `refreshUncleCredits` then runs in its own `Try`, and
+   a failure is logged at error level and ignored. Before, an exception from the refresh reached the outer
+   `catch`, which returned `None` and so dropped the parent request for a block that was already stored.
+   - `Try` catches non-fatal exceptions only. A fatal error (for example an out-of-memory error) still reaches the
+     outer `catch`, as it does for the rest of the method.
+
+Spec to run for round 2, in addition to the round 1 list:
+
+```
+sbt "testOnly org.ergoplatform.http.routes.BlocksApiRouteSpec org.ergoplatform.nodeView.history.modifierprocessors.InputBlockUnclesSpecification org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification"
+```
+
+No spec forces `refreshUncleCredits` to throw: it is private and has no failure injection point, and adding one
+only for a test would change production code beyond the request.

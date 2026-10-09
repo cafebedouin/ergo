@@ -948,9 +948,12 @@ trait InputBlocksProcessor extends ScorexLogging {
           updateTree(tree)
       }
 
-      // header-level uncles: credit of this block, and of blocks referencing it or descending from it
+      // header-level uncles: credit of this block, and of blocks referencing it or descending from it. Its own
+      // Try, so a failure is logged and never affects block handling (toDownload is returned as computed)
       if (inputBlockUnclesEnabled) {
-        refreshUncleCredits(orderingId)
+        Try(refreshUncleCredits(orderingId)).failed.foreach { e =>
+          log.error(s"Uncle credit refresh failed for ordering block $orderingId after input block ${ib.id}", e)
+        }
       }
 
       toDownload

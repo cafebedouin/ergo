@@ -1,5 +1,6 @@
 package org.ergoplatform.http.routes
 
+import akka.actor.{Actor, Props}
 import akka.http.scaladsl.model.{ContentTypes, HttpEntity, StatusCodes, UniversalEntity}
 import akka.http.scaladsl.server.Route
 import akka.http.scaladsl.testkit.ScalatestRouteTest
@@ -9,8 +10,9 @@ import io.circe.syntax._
 import org.ergoplatform.http.api.BlocksApiRoute
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.history.header.Header
+import org.ergoplatform.nodeView.ErgoReadersHolder.GetDataFromHistory
 import org.ergoplatform.settings.Algos
-import org.ergoplatform.utils.Stubs
+import org.ergoplatform.utils.{InputBlockUnclesTestHelpers, Stubs}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import scorex.util.ModifierId
@@ -160,6 +162,37 @@ class BlocksApiRouteSpec
     }
     Get(prefix + "/bestInputChain") ~> route ~> check {
       responseAs[Json].hcursor.downField("creditedUncles").focus shouldBe None
+    }
+  }
+
+  it should "report a credited uncle in /blocks/bestInputChain and /blocks/bestInputBlock" in {
+    object helpers extends InputBlockUnclesTestHelpers with Matchers
+    // flag-on history: chain A <- B, sibling S (child of A), C (child of B) referencing S
+    val (h, us) = helpers.setup()
+    val (_, b, s) = helpers.chainWithSibling(h, us, Seq(helpers.spend(helpers.boxes(2))))
+    val cTxs = Seq(helpers.spend(helpers.boxes(3)))
+    val c = helpers.announce(h, us, Some(b.id), cTxs, uncles = Seq(s.id))
+    helpers.process(h, us, c, cTxs)._1 shouldBe Seq(c.id)
+    h.getCreditedUncles(c.id) shouldBe Seq(s.id)
+
+    val readers = system.actorOf(Props(new Actor {
+      def receive: Receive = {
+        case GetDataFromHistory(f) => sender() ! f(h)
+      }
+    }))
+    val unclesSettings = settings.copy(nodeSettings = settings.nodeSettings.copy(inputBlockUncles = true))
+    val unclesRoute = BlocksApiRoute(nodeViewRef, readers, unclesSettings).route
+
+    Get(prefix + "/bestInputChain") ~> unclesRoute ~> check {
+      status shouldBe StatusCodes.OK
+      val credited = responseAs[Json].hcursor.downField("creditedUncles")
+      credited.downField(c.id).as[Seq[String]] shouldBe Right(Seq(s.id))
+      credited.downField(b.id).as[Seq[String]] shouldBe Right(Seq.empty)
+    }
+    Get(prefix + "/bestInputBlock") ~> unclesRoute ~> check {
+      status shouldBe StatusCodes.OK
+      responseAs[Json].hcursor.downField("bestInputBlock").as[String] shouldBe Right(c.id)
+      responseAs[Json].hcursor.downField("creditedUncles").as[Seq[String]] shouldBe Right(Seq(s.id))
     }
   }
 
