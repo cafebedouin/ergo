@@ -264,7 +264,10 @@ class CandidateGenerator(
         ergoSettings.chainSettings.powScheme.validate(currentBlock.header) match {
           case success @ Success(_) => Right(currentBlock -> success)
           case Failure(exception) =>
-            state.cachedPreviousCandidate.map { candidate =>
+            // only a previous candidate on the current one's parent: one on an older parent would mine a sibling of the
+            // block the current candidate builds on
+            val currentParentId = state.cachedCandidate.flatMap(_.candidateBlock.parentOpt).map(_.id)
+            state.cachedPreviousCandidate.filter(_.candidateBlock.parentOpt.map(_.id) == currentParentId).map { candidate =>
               log.info(s"Using previous candidate as a solution: $candidate")
               val previousBlock = completeBlock(candidate.candidateBlock, solution)
               previousBlock -> ergoSettings.chainSettings.powScheme.validate(previousBlock.header)
