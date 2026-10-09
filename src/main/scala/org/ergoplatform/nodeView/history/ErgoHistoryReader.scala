@@ -37,8 +37,6 @@ trait ErgoHistoryReader
 
   override protected def nipopowSettings: NipopowSettings = settings.nodeSettings.nipopowSettings
 
-  override protected def inputBlockUnclesEnabled: Boolean = settings.nodeSettings.inputBlockUncles
-
   private val Valid = 1.toByte
   private val Invalid = 0.toByte
 

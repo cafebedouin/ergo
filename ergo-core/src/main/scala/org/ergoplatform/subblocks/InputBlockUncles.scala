@@ -27,16 +27,6 @@ object InputBlockUncles {
   /** Input block announcement version carrying uncle ids. */
   val UnclesMessageVersion: Byte = 2.toByte
 
-  /**
-    * Room left in maxBlockCost for the reward (emission and fee) transactions of the ordering block that will
-    * confirm the collected transactions. Collected transactions of an input block chain (with uncles) must not
-    * cost more than `maxBlockCost - RewardCostReserve`.
-    */
-  val RewardCostReserve: Long = 100000L
-
-  /** Room left in maxBlockSize for the reward transactions, see `RewardCostReserve`. */
-  val RewardSizeReserve: Long = 4096L
-
   /** Extension field value for the uncle ids given. */
   def fieldValue(ids: Seq[Array[Byte]]): Array[Byte] = Array.concat(ids: _*)
 

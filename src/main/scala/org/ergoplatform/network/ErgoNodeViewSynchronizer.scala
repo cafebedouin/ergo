@@ -289,7 +289,6 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     context.system.eventStream.subscribe(self, classOf[DownloadInputBlock])
     context.system.eventStream.subscribe(self, classOf[DownloadInputBlockTransactions])
     context.system.eventStream.subscribe(self, classOf[NewBestInputBlock])
-    context.system.eventStream.subscribe(self, classOf[NewInputBlockSibling])
     context.system.eventStream.subscribe(self, classOf[LocallyGeneratedOrderingBlock])
 
     // subscribe for immediate block mining announcements (fast propagation)
@@ -1948,9 +1947,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
         hr.getInputBlockTransactions(bytesToId(t._2)).isDefined
       }.getOrElse(true)
 
-      // with input-block uncles enabled, the node view holder waits a little for missing input blocks before
-      // downloading the block transactions, so it gets the ordering block in any case
-      if (inputBlockStored || settings.nodeSettings.inputBlockUncles) {
+      if (inputBlockStored) {
         log.info(s"Processing ordering block ${oba.header.id}") // todo: make it .debug
         viewHolderRef ! ProcessOrderingBlock(oba)
       } else {
@@ -2381,48 +2378,37 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     // todo: broadcast only locally generated new best input block?
     case NewBestInputBlock(Some(id), local) =>
-      broadcastInputBlock(historyReader, id, local)
+      historyReader.getInputBlock(id) match {
+        case Some(preIbi) =>
+          val peers = inputBlockRecipients(historyReader)
+          if (local) {
+            log.debug(s"Sending locally generated input block $id out")
 
-    // a valid sibling (input-block uncles enabled): relayed like a best input block, as later blocks may merge it
-    case NewInputBlockSibling(id, local) =>
-      broadcastInputBlock(historyReader, id, local)
+            // we propagate input block with transactions immediately if it has no more than 3 transactions
+            // todo: check number of transactions on retrieval
+            // todo: improve high/low bandwidth rules
+            val ibi = if (preIbi.weakTxIds.getOrElse(Seq.empty).size <= 3) {
+              preIbi
+            } else {
+              preIbi.copy(weakTxIds = None)
+            }
+            val msg = Message(InputBlockMessageSpec, Right(ibi), None)
+            networkControllerRef ! SendToNetwork(msg, SendToPeers(peers))
+          } else if (peers.nonEmpty) {
+            // an input block received from a peer: announce its id only, as ordering-block announcements are
+            // relayed, so it travels beyond the miner's own peers; a peer that lacks it requests it
+            // (processInv -> modifiersReq -> processInputBlockRequest)
+            val msg = Message(InvSpec, Right(InvData(InputBlockTypeId.value, Seq(id))), None)
+            networkControllerRef ! SendToNetwork(msg, SendToPeers(peers))
+          }
+        case None =>
+          // shouldnt be there by input block processing logic
+          log.error(s"NewBestInputBlock arrived for unknown input block $id")
+      }
+
 
     // this signal is sent on ordering block application, nothing p2p layer should do
     case NewBestInputBlock(None, _) =>
-  }
-
-  /**
-    * Sends a locally generated input block to the peers (with its transaction ids if it has at most 3
-    * transactions), or announces the id of an input block received from a peer.
-    */
-  private def broadcastInputBlock(historyReader: ErgoHistoryReader, id: ModifierId, local: Boolean): Unit = {
-    historyReader.getInputBlock(id) match {
-      case Some(preIbi) =>
-        val peers = inputBlockRecipients(historyReader)
-        if (local) {
-          log.debug(s"Sending locally generated input block $id out")
-
-          // we propagate input block with transactions immediately if it has no more than 3 transactions
-          // todo: check number of transactions on retrieval
-          // todo: improve high/low bandwidth rules
-          val ibi = if (preIbi.weakTxIds.getOrElse(Seq.empty).size <= 3) {
-            preIbi
-          } else {
-            preIbi.copy(weakTxIds = None)
-          }
-          val msg = Message(InputBlockMessageSpec, Right(ibi), None)
-          networkControllerRef ! SendToNetwork(msg, SendToPeers(peers))
-        } else if (peers.nonEmpty) {
-          // an input block received from a peer: announce its id only, as ordering-block announcements are
-          // relayed, so it travels beyond the miner's own peers; a peer that lacks it requests it
-          // (processInv -> modifiersReq -> processInputBlockRequest)
-          val msg = Message(InvSpec, Right(InvData(InputBlockTypeId.value, Seq(id))), None)
-          networkControllerRef ! SendToNetwork(msg, SendToPeers(peers))
-        }
-      case None =>
-        // shouldnt be there by input block processing logic
-        log.error(s"Input block to broadcast is unknown: $id")
-    }
   }
 
   /** handlers of messages coming from peers */

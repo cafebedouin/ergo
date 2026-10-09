@@ -11,8 +11,7 @@ import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransacti
 import org.ergoplatform.modifiers.transaction.TooHighCostError
 import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock, NetworkObjectTypeId, TransactionsCarryingBlockSection}
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages._
-import org.ergoplatform.nodeView.ErgoNodeViewHolder.{BlockAppliedTransactions, CurrentView, DownloadInputBlock, DownloadRequest, MaxPendingOrderingBlocks, OrderingBlockRebuildWait, RetryOrderingBlockRebuild}
-import org.ergoplatform.nodeView.history.modifierprocessors.InputBlocksProcessor.InputBlocksMissing
+import org.ergoplatform.nodeView.ErgoNodeViewHolder.{BlockAppliedTransactions, CurrentView, DownloadInputBlock, DownloadRequest}
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages._
 import org.ergoplatform.nodeView.history.ErgoHistory
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
@@ -32,7 +31,6 @@ import org.ergoplatform.subblocks.InputBlockAnnouncement
 import scorex.core.network.ConnectedPeer
 
 import scala.annotation.tailrec
-import scala.concurrent.duration._
 import scala.util.{Failure, Success, Try}
 
 /**
@@ -277,13 +275,8 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
 
   protected def txModify(unconfirmedTx: UnconfirmedTransaction): ProcessingOutcome = {
     val tx = unconfirmedTx.transaction
-    val inputBlockTransactions = if (settings.nodeSettings.inputBlockUncles) {
-      // collected transactions of the best input block chain, including the ones merged from uncles
-      history().getBestOrderingCollectedInputBlocksTransactions()
-    } else {
-      history().bestInputBlocksChain().flatMap { id =>
-        history().getInputBlockTransactions(id).getOrElse(Seq.empty)
-      }
+    val inputBlockTransactions = history().bestInputBlocksChain().flatMap { id =>
+      history().getInputBlockTransactions(id).getOrElse(Seq.empty)
     }
     val (newPool, processingOutcome) = memoryPool().process(unconfirmedTx, minimalState(), inputBlockTransactions)
     processingOutcome match {
@@ -363,14 +356,6 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         context.system.eventStream.publish(DownloadInputBlock(inputId, remote))
       }
 
-      // ask for uncles the input block merges which are not known yet (input-block uncles enabled only)
-      if (history().getInputBlock(inputBlockInfo.id).isDefined) {
-        history().missingUncles(inputBlockInfo).foreach { uncleId =>
-          log.debug(s"Don't have uncle $uncleId of input-block ${inputBlockInfo.id}, asking it")
-          context.system.eventStream.publish(DownloadInputBlock(uncleId, remote))
-        }
-      }
-
       history().getInputBlockTransactions(inputBlockInfo.id) match {
         case Some(txs) =>
           // we already have transactions, that is possible sometimes if they arrive before the input block
@@ -387,12 +372,6 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
 
     case ProcessOrderingBlock(orderingBlockAnnouncement) =>
       processOrderingBlock(orderingBlockAnnouncement)
-
-    // the wait for input blocks to rebuild an ordering block's transactions is over: last attempt, then download
-    case RetryOrderingBlockRebuild(headerId) =>
-      pendingOrderingBlocks.get(headerId).foreach { case (oba, own) =>
-        rebuildOrderingBlock(oba, own, lastAttempt = true)
-      }
   }
 
   /**
@@ -410,10 +389,6 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         history().applyInputBlockTransactions(inputBlockId, transactions, minimalState())
       }
 
-      // transactions an input block merged from its uncles (input-block uncles enabled only)
-      def uncleTransactions(id: ModifierId): Seq[ErgoTransaction] =
-        history().getInputBlockUncles(id).flatMap(u => history().getInputBlockTransactions(u).getOrElse(Seq.empty))
-
       rollbackInputBlocks.foreach { id =>
         history().getInputBlockTransactions(id) match {
           case Some(txs) =>
@@ -423,10 +398,6 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
             val newVault = vault().rollbackInputBlock(id)
             updateNodeView(updatedVault = Some(newVault))
           case None =>
-        }
-        val mergedTxs = uncleTransactions(id)
-        if (mergedTxs.nonEmpty) {
-          updateNodeView(updatedMempool = Some(memoryPool().put(mergedTxs.map(tx => UnconfirmedTransaction(tx, None)))))
         }
       }
 
@@ -441,25 +412,12 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
             updateNodeView(updatedVault = Some(newVault))
           case None =>
         }
-        val mergedTxs = uncleTransactions(id)
-        if (mergedTxs.nonEmpty) {
-          updateNodeView(updatedMempool = Some(memoryPool().removeWithDoubleSpends(mergedTxs)))
-        }
       }
 
       // send rollback signal
       newBestInputBlocks.foreach { id =>
         log.debug(s"New input-block with transactions found: $id")
         context.system.eventStream.publish(NewBestInputBlock(Some(id), local))
-      }
-
-      if (settings.nodeSettings.inputBlockUncles) {
-        // a valid sibling is relayed, as later input blocks and ordering blocks may merge it as an uncle
-        if (!newBestInputBlocks.contains(inputBlockId) && history().getInputBlockValidity(inputBlockId).contains(true)) {
-          context.system.eventStream.publish(NewInputBlockSibling(inputBlockId, local))
-        }
-        // ordering blocks waiting for input blocks may be rebuilt now
-        retryPendingOrderingBlocks()
       }
     } catch {
       case t: Throwable => log.error(s"Exception during input block $inputBlockId processing ", t)
@@ -488,21 +446,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         // todo: download only txs which are not in the mempool if allTransactionsDownloaded == false,
         // todo: currently the whole block is downloaded
 
-        // With input-block uncles enabled, the transactions are rebuilt by the history (the function shared with the
-        // generator): L of the input block the ordering block links, in the input block tree of its parent, with
-        // the uncles it references, then its own transactions; checked against the transactions root. If input
-        // blocks or transactions are missing it waits for them (rebuildOrderingBlock); a root mismatch, or still
-        // missing after the wait, falls back to a full download.
-        if (settings.nodeSettings.inputBlockUncles) {
-          val orderingBlockTransactions = oba.nonBroadcastedTransactions ++ mempoolTransactions
-          if (allTransactionsDownloaded) {
-            rebuildOrderingBlock(oba, orderingBlockTransactions, lastAttempt = false)
-          } else {
-            log.warn(s"Downloading block transactions fully for $headerId: not all its broadcasted transactions are " +
-              s"in the mempool")
-            context.system.eventStream.publish(DownloadRequest(Map(BlockTransactions.modifierTypeId -> Seq(header.transactionsId))))
-          }
-        } else if (allTransactionsDownloaded) {
+        if (allTransactionsDownloaded) {
           val orderingBlockTransactions = oba.nonBroadcastedTransactions ++ mempoolTransactions
           history().saveOrderingBlockTransactions(headerId, orderingBlockTransactions)
           val inputBlocksTransactions = history().getCollectedInputBlocksTransactions(headerId).getOrElse(Seq.empty)
@@ -553,58 +497,6 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         )
         
         log.info(s"Requested parent header $parentId for ordering block $headerId")
-    }
-  }
-
-  /**
-    * Input-block uncles enabled only: ordering blocks whose transactions could not be rebuilt yet because an input
-    * block, a path element or an uncle's transactions had not arrived, with their own transactions. They are
-    * retried whenever input block transactions are processed, and fall back to a full download after
-    * `OrderingBlockRebuildWait`.
-    */
-  private val pendingOrderingBlocks = scala.collection.mutable.LinkedHashMap[ModifierId, (OrderingBlockAnnouncement, Seq[ErgoTransaction])]()
-
-  /**
-    * Rebuilds an ordering block's transactions from input blocks (the history function shared with the
-    * generator) and applies them. If input blocks or transactions are missing and this is not the last attempt,
-    * the block waits for them (see pendingOrderingBlocks); otherwise, or on a root mismatch, its transactions are
-    * downloaded.
-    */
-  private def rebuildOrderingBlock(oba: OrderingBlockAnnouncement,
-                                   orderingBlockTransactions: Seq[ErgoTransaction],
-                                   lastAttempt: Boolean): Unit = {
-    val header = oba.header
-    val headerId = header.id
-    if (history().contains(header.transactionsId)) {
-      pendingOrderingBlocks.remove(headerId)
-    } else {
-      history().rebuildOrderingBlockTransactions(header, oba.extensionFields, orderingBlockTransactions) match {
-        case Right(txs) =>
-          pendingOrderingBlocks.remove(headerId)
-          history().saveOrderingBlockTransactions(headerId, orderingBlockTransactions)
-          log.info(s"Applying block transactions rebuilt from input-blocks for $headerId with transactions: " +
-            s"${txs.length} [${txs.map(_.id).mkString(", ")}]")
-          pmodModify(new BlockTransactions(headerId, header.version, txs), local = false)
-          context.system.eventStream.publish(NewBestInputBlock(None, local = false))
-        case Left(InputBlocksMissing(reason)) if !lastAttempt &&
-          (pendingOrderingBlocks.contains(headerId) || pendingOrderingBlocks.size < MaxPendingOrderingBlocks) =>
-          if (!pendingOrderingBlocks.contains(headerId)) {
-            log.info(s"Waiting up to $OrderingBlockRebuildWait to rebuild block transactions of $headerId: $reason")
-            pendingOrderingBlocks.put(headerId, oba -> orderingBlockTransactions)
-            context.system.scheduler.scheduleOnce(OrderingBlockRebuildWait, self, RetryOrderingBlockRebuild(headerId))(context.dispatcher)
-          }
-        case Left(failure) =>
-          pendingOrderingBlocks.remove(headerId)
-          log.warn(s"Downloading block transactions fully for $headerId: ${failure.reason}")
-          context.system.eventStream.publish(DownloadRequest(Map(BlockTransactions.modifierTypeId -> Seq(header.transactionsId))))
-      }
-    }
-  }
-
-  /** Retries the pending ordering blocks, after new input block data arrived. */
-  private def retryPendingOrderingBlocks(): Unit = {
-    pendingOrderingBlocks.toList.foreach { case (_, (oba, own)) =>
-      rebuildOrderingBlock(oba, own, lastAttempt = false)
     }
   }
 
@@ -1128,15 +1020,6 @@ object ErgoNodeViewHolder {
   case class DownloadRequest(modifiersToFetch: Map[NetworkObjectTypeId.Value, Seq[ModifierId]]) extends NodeViewHolderEvent
 
   case class DownloadInputBlock(subblockId: ModifierId, remote: ConnectedPeer)
-
-  /** Last attempt to rebuild a pending ordering block's transactions from input blocks (uncles enabled only) */
-  case class RetryOrderingBlockRebuild(headerId: ModifierId)
-
-  /** How long an ordering block waits for missing input blocks or transactions before a full download */
-  val OrderingBlockRebuildWait: FiniteDuration = 2.seconds
-
-  /** At most this many ordering blocks wait for input blocks at once (more are downloaded at once) */
-  val MaxPendingOrderingBlocks: Int = 16
   case class DownloadInputBlockTransactions(req: InputBlockTransactionsRequest, remote: ConnectedPeer)
 
   case class CurrentView[State](history: ErgoHistory, state: State, vault: ErgoWallet, pool: ErgoMemPool)

@@ -60,15 +60,6 @@ object ErgoNodeViewSynchronizerMessages {
     case class NewBestInputBlock(idOpt: Option[ModifierId], local: Boolean) extends NodeViewChange
 
     /**
-      * Input-block uncles enabled only: an input block which is not the best one (a sibling) was found valid
-      * against its own prefix, so a later input block may merge it as an uncle. Peers need it to validate such
-      * blocks and to rebuild ordering blocks merging it, so it is relayed like a best input block.
-      *
-      * @param local - if true, the input block is generated locally
-      */
-    case class NewInputBlockSibling(id: ModifierId, local: Boolean)
-
-    /**
      * Event which is published when rollback happened (on finding a better chain)
      *
      * @param branchPoint - block id which is last in the chain after rollback (before applying blocks from a fork)
