@@ -1,6 +1,8 @@
 package org.ergoplatform.nodeView.history.modifierprocessors
 
-import org.ergoplatform.subblocks.InputBlockUncles
+import org.ergoplatform.nodeView.history.ErgoHistory
+import org.ergoplatform.nodeView.state.UtxoState
+import org.ergoplatform.subblocks.{InputBlockAnnouncement, InputBlockUncles}
 import org.ergoplatform.utils.{ErgoCorePropertyTest, InputBlockUnclesTestHelpers}
 import scorex.util.{bytesToId, idToBytes}
 
@@ -236,6 +238,103 @@ class InputBlockUnclesSpecification extends ErgoCorePropertyTest with InputBlock
     h.getCreditedUncles(c.id) shouldBe Seq.empty
     h.uncleCandidates() shouldBe Seq.empty
     h.isSiblingAnnouncement(announce(h, us, Some(a.id), Seq.empty)) shouldBe false
+  }
+
+  // Round 4, item 2: sibling bodies are fetched only when needed
+
+  property("sibling body not wanted; a later child of it is, and its body-less ancestors are fetched") {
+    val (h, us) = setup()
+    val (a, b, _) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    // a sibling (child of A) arriving while A, B is the processed chain: announcement only
+    val s2 = announce(h, us, Some(a.id), Seq(spend(boxes(4))))
+    h.inputBlockBodyWanted(s2) shouldBe false
+    h.applyInputBlock(s2) shouldBe None
+    h.getInputBlockTransactionIds(s2.id) shouldBe None
+    // its child makes the sibling branch longer than the processed chain: wanted, and the sibling's body too
+    val t = announce(h, us, Some(s2.id), Seq(spend(boxes(5))))
+    h.inputBlockBodyWanted(t) shouldBe true
+    h.bodilessAncestors(t).map(_.id) shouldBe Seq(s2.id)
+    // a block extending the best chain: wanted, nothing else to fetch
+    val c = announce(h, us, Some(b.id), Seq(spend(boxes(3))))
+    h.inputBlockBodyWanted(c) shouldBe true
+    h.bodilessAncestors(c) shouldBe Seq.empty
+  }
+
+  property("uncles disabled: every body wanted, no ancestor fetch (base behaviour)") {
+    val (h, us) = setup(uncles = false)
+    val (a, _, _) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    val s2 = announce(h, us, Some(a.id), Seq(spend(boxes(4))))
+    h.inputBlockBodyWanted(s2) shouldBe true
+    h.applyInputBlock(s2) shouldBe None
+    val t = announce(h, us, Some(s2.id), Seq(spend(boxes(5))))
+    h.bodilessAncestors(t) shouldBe Seq.empty
+  }
+
+  /** A, B processed; S (child of A) and T (child of S) announced without bodies. */
+  private def siblingBranchWithoutBodies(): (ErgoHistory, UtxoState, InputBlockAnnouncement, InputBlockAnnouncement,
+    InputBlockAnnouncement, InputBlockAnnouncement) = {
+    val (h, us) = setup()
+    val a = announce(h, us, None, Seq(spend(boxes(0))))
+    process(h, us, a, Seq(spend(boxes(0))))._1 shouldBe Seq(a.id)
+    val b = announce(h, us, Some(a.id), Seq(spend(boxes(1))))
+    process(h, us, b, Seq(spend(boxes(1))))._1 shouldBe Seq(b.id)
+    val s = announce(h, us, Some(a.id), Seq(spend(boxes(2))))
+    h.applyInputBlock(s) shouldBe None
+    val t = announce(h, us, Some(s.id), Seq(spend(boxes(3))))
+    h.applyInputBlock(t) shouldBe None
+    (h, us, a, b, s, t)
+  }
+
+  property("switch to the sibling's fork applies once its late bodies arrive, the child's first") {
+    val (h, us, a, b, s, t) = siblingBranchWithoutBodies()
+    h.applyInputBlockTransactions(t.id, Seq(spend(boxes(3))), us) shouldBe (Seq.empty -> Seq.empty)
+    // the sibling's body completes the longer branch: the fork choice switches to it
+    h.applyInputBlockTransactions(s.id, Seq(spend(boxes(2))), us) shouldBe (Seq(s.id, t.id) -> Seq(b.id))
+    h.bestInputBlocksChain() shouldBe Seq(t.id, s.id, a.id)
+  }
+
+  property("switch to the sibling's fork applies once its late bodies arrive, the sibling's first") {
+    val (h, us, a, b, s, t) = siblingBranchWithoutBodies()
+    h.applyInputBlockTransactions(s.id, Seq(spend(boxes(2))), us) shouldBe (Seq.empty -> Seq.empty)
+    h.applyInputBlockTransactions(t.id, Seq(spend(boxes(3))), us) shouldBe (Seq(s.id, t.id) -> Seq(b.id))
+    h.bestInputBlocksChain() shouldBe Seq(t.id, s.id, a.id)
+  }
+
+  // Round 4, item 3: an own-mined block that never became best is announced (node view holder spec); a peer that
+  // received the announcement credits it, without its body
+
+  property("a block whose body failed on its miner is still credited by a peer that received its announcement") {
+    val (h, us) = setup()
+    val (a, b, _) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    // mined elsewhere, its body never valid: the peer has the announcement only
+    val lost = announce(h, us, Some(a.id), Seq(spend(trueBox("absent"))))
+    h.applyInputBlock(lost) shouldBe None
+    val c = announce(h, us, Some(b.id), Seq(spend(boxes(3))), uncles = Seq(lost.id))
+    process(h, us, c, Seq(spend(boxes(3))))._1 shouldBe Seq(c.id)
+    h.getCreditedUncles(c.id) shouldBe Seq(lost.id)
+  }
+
+  // Round 4, item 1, open question: credit is header-level, so it cannot tell a sibling repeating its parent's
+  // transactions from a valid one (see HEADER-NOTES.md, Round 4). This documents the behaviour.
+
+  property("credit does not check a sibling's transactions: one repeating its parent's is credited") {
+    val (h, us) = setup()
+    val (a, b, _) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    // child of A repeating A's transaction (it would fail "Double spending" if processed)
+    val repeating = announce(h, us, Some(a.id), Seq(spend(boxes(0))))
+    h.applyInputBlock(repeating) shouldBe None
+    val c = announce(h, us, Some(b.id), Seq(spend(boxes(3))), uncles = Seq(repeating.id))
+    process(h, us, c, Seq(spend(boxes(3))))._1 shouldBe Seq(c.id)
+    h.getCreditedUncles(c.id) shouldBe Seq(repeating.id)
+  }
+
+  property("chain transactions through a block: the bodies of its known chain, in order") {
+    val (h, us) = setup()
+    val (a, b, s) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    h.chainTransactionsThrough(None) shouldBe Seq.empty
+    h.chainTransactionsThrough(Some(b.id)).map(_.id) shouldBe Seq(boxes(0), boxes(1)).map(bx => spend(bx).id)
+    h.chainTransactionsThrough(Some(s.id)).map(_.id) shouldBe Seq(boxes(0), boxes(2)).map(bx => spend(bx).id)
+    h.chainTransactionsThrough(Some(a.id)).map(_.id) shouldBe Seq(spend(boxes(0)).id)
   }
 
 }

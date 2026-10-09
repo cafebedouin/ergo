@@ -72,8 +72,11 @@ class ErgoNodeViewSynchronizerSpecification
     }
   }
 
-  private def withFixture2(testCode: Synchronizer2Fixture => Any): Unit = {
-    val fixture = new Synchronizer2Fixture
+  private def withFixture2(testCode: Synchronizer2Fixture => Any): Unit = withFixture2Uncles(uncles = false)(testCode)
+
+  /** `withFixture2` with the node setting inputBlockUncles given (history and synchronizer alike) */
+  private def withFixture2Uncles(uncles: Boolean)(testCode: Synchronizer2Fixture => Any): Unit = {
+    val fixture = new Synchronizer2Fixture(uncles)
     try {
       testCode(fixture)
     } finally {
@@ -240,7 +243,7 @@ class ErgoNodeViewSynchronizerSpecification
     ) = nodeViewSynchronizer
   }
 
-  class Synchronizer2Fixture extends AkkaFixture {
+  class Synchronizer2Fixture(inputBlockUncles: Boolean = false) extends AkkaFixture {
     implicit val ec: ExecutionContextExecutor = system.dispatcher
     val ncProbe                               = TestProbe("NetworkControllerProbe")
     val pchProbe                              = TestProbe("PeerHandlerProbe")
@@ -249,7 +252,8 @@ class ErgoNodeViewSynchronizerSpecification
     // concurrent or sequential tests reusing the same on-disk history.
     val settings: ErgoSettings = {
       val baseSettings = org.ergoplatform.utils.ErgoNodeTestConstants.settings
-      baseSettings.copy(directory = createTempDir.getAbsolutePath)
+      baseSettings.copy(directory = createTempDir.getAbsolutePath,
+        nodeSettings = baseSettings.nodeSettings.copy(inputBlockUncles = inputBlockUncles))
     }
 
     val syncTracker                           = ErgoSyncTracker(settings.scorexSettings.network)
@@ -1367,6 +1371,81 @@ class ErgoNodeViewSynchronizerSpecification
         inv.typeId shouldBe InputBlockTypeId.value
         inv.ids shouldBe Seq(header.id)
       }
+    }
+  }
+
+  /**
+    * Round 4, item 2 (input-block uncles): A, B is the processed input chain; S (child of A) is a sibling and T
+    * (child of S) makes the sibling branch longer than the processed chain. `check` gets S's and T's ids, and the
+    * input block ids whose transaction ids were requested on S's announcement, then on T's.
+    */
+  private def siblingBodyRequests(uncles: Boolean)
+                                 (check: (ModifierId, ModifierId, Seq[ModifierId], Seq[ModifierId]) => Any): Unit = {
+    withFixture2Uncles(uncles) { ctx =>
+      import ctx._
+      import org.ergoplatform.modifiers.InputBlockTransactionIdsTypeId
+      import org.ergoplatform.utils.generators.ChainGenerator.applyBlock
+      object helpers extends org.ergoplatform.utils.InputBlockUnclesTestHelpers with Matchers
+
+      val hist = ErgoHistory.readOrGenerate(settings)(null)
+      val wrappedState = boxesHolderGen
+        .map(WrappedUtxoState(_, createTempDir, parameters, settings))
+        .sample
+        .get
+      val mempool = ErgoMemPool.empty(settings)
+      synchronizerMockRef ! ChangedState(wrappedState)
+      synchronizerMockRef ! ChangedHistory(hist)
+      synchronizerMockRef ! ChangedMempool(mempool)
+      Thread.sleep(500)
+
+      val chain = genChain(1, hist)
+      applyBlock(hist, chain.head)
+
+      // A and B: stored and processed with empty bodies
+      val baseHeader = buildValidInputBlockAnnouncement(Some(chain.head)).header
+      val a = helpers.announceOn(baseHeader, None, Seq.empty)
+      val b = helpers.announceOn(baseHeader.copy(timestamp = baseHeader.timestamp + 1), Some(a.id), Seq.empty)
+      Seq(a, b).foreach { ib =>
+        hist.applyInputBlock(ib) shouldBe None
+        hist.applyInputBlockTransactions(ib.id, Seq.empty, wrappedState)._1 shouldBe Seq(ib.id)
+      }
+      hist.bestInputBlocksChain() shouldBe Seq(b.id, a.id)
+
+      def requested(): Seq[ModifierId] = {
+        ncProbe.receiveWhile(max = 1.second, idle = 300.millis) { case m => m }.collect {
+          case stn: SendToNetwork if stn.message.spec.messageCode == RequestModifierSpec.messageCode =>
+            stn.message.data.toOption.collect {
+              case inv: InvData if inv.typeId == InputBlockTransactionIdsTypeId.value => inv.ids
+            }.getOrElse(Seq.empty)
+        }.flatten
+      }
+
+      val (sHeader, _, sFields) = buildValidBlockWithInputBlockFields(Some(chain.head), Some(a.id))
+      val s = InputBlockAnnouncement(InputBlockAnnouncement.initialMessageVersion, sHeader, sFields, None)
+      synchronizerMockRef.underlyingActor.processInputBlock(s, hist, mempool, peer, Some(wrappedState))
+      val onSibling = requested()
+
+      // the node view holder is a separate instance here: store S in this history by hand
+      hist.applyInputBlock(s) shouldBe None
+      val (tHeader, _, tFields) = buildValidBlockWithInputBlockFields(Some(chain.head), Some(s.id))
+      val t = InputBlockAnnouncement(InputBlockAnnouncement.initialMessageVersion, tHeader, tFields, None)
+      synchronizerMockRef.underlyingActor.processInputBlock(t, hist, mempool, peer, Some(wrappedState))
+      val onChild = requested()
+      check(s.id, t.id, onSibling, onChild)
+    }
+  }
+
+  property("NodeViewSynchronizer: uncles enabled, a sibling's transactions are fetched only once a child needs them") {
+    siblingBodyRequests(uncles = true) { (s, t, onSibling, onChild) =>
+      onSibling should not contain s
+      onChild should contain(s)
+      onChild should contain(t)
+    }
+  }
+
+  property("NodeViewSynchronizer: uncles disabled, a sibling's transactions are fetched on its announcement (base)") {
+    siblingBodyRequests(uncles = false) { (s, _, onSibling, _) =>
+      onSibling should contain(s)
     }
   }
 

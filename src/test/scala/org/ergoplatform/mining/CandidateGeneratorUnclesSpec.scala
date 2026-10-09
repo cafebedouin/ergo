@@ -1,10 +1,11 @@
 package org.ergoplatform.mining
 
 import org.ergoplatform.AutolykosSolution
-import org.ergoplatform.mining.CandidateGenerator.{Candidate, EarlierCandidateOnBestParent, MinedOnCurrentCandidate,
-  MinedOnEarlierCandidate, NoCandidateForInputSolution}
+import org.ergoplatform.mining.CandidateGenerator.{Candidate, MinedOnCurrentCandidate, MinedOnEarlierCandidate,
+  NoCandidateForInputSolution, RepeatsPrefixTransactions}
 import org.ergoplatform.modifiers.history.extension.Extension
 import org.ergoplatform.modifiers.history.header.Header
+import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.history.ErgoHistory
 import org.ergoplatform.nodeView.state.UtxoState
 import org.ergoplatform.settings.{Algos, ErgoSettings, ErgoValidationSettingsUpdate, Parameters}
@@ -143,34 +144,72 @@ class CandidateGeneratorUnclesSpec extends ErgoCorePropertyTest with InputBlockU
     CandidateGenerator.inputSolutionCandidate(Seq(newer), solution, minedOnOlder) shouldBe None
   }
 
-  /**
-    * A candidate on the current best input block was built before the miner's previous block applied its
-    * transactions, so it repeats them; a solution on it is refused, as without uncles support. A candidate on an
-    * earlier block gives a sibling and is accepted.
-    */
-  property("input solution on an earlier candidate is refused if its parent is the current best input block") {
-    val (h, us) = setup()
-    val (_, b, _) = chainWithSibling(h, us, Seq(spend(boxes(2))))
-    val older = candidate(h, us, unclesSettings)
-    older.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) shouldBe Some(b.id)
-    val current = older.copy(candidateBlock = older.candidateBlock.copy(timestamp = older.candidateBlock.timestamp + 1))
-    val (olderBlock, _) = CandidateGenerator.completeInputBlock(older.candidateBlock, solution)
-    val (currentBlock, _) = CandidateGenerator.completeInputBlock(current.candidateBlock, solution)
-    val minedOn = (id: ModifierId) => (header: Header, _: Parameters) => header.id == id
-    val best = h.bestInputBlock().map(_.id)
-    best shouldBe Some(b.id)
+  private def minedOn(id: ModifierId) = (header: Header, _: Parameters) => header.id == id
 
-    CandidateGenerator.judgeInputSolution(current, Seq(older), solution, minedOn(olderBlock.id), best) match {
-      case EarlierCandidateOnBestParent(sbi) => sbi.id shouldBe olderBlock.id
+  private def prefixOf(h: ErgoHistory) = (parent: Option[ModifierId]) => h.chainTransactionsThrough(parent)
+
+  /**
+    * A chain A (processed) and P (child of A, the node's own new block): P's announcement is stored, its body is not
+    * processed yet, and a candidate is assembled on P in that window. While the mempool still held P's
+    * transactions, such a candidate repeats them; here the candidate's transactions are `windowTxs`. P's body is
+    * processed by the time the solution arrives.
+    */
+  private def builtInWindow(pTxs: Seq[ErgoTransaction],
+                            windowTxs: Seq[ErgoTransaction]): (ErgoHistory, Candidate, Candidate, ModifierId) = {
+    val (h, us) = setup()
+    val a = announce(h, us, None, Seq(spend(boxes(0))))
+    process(h, us, a, Seq(spend(boxes(0))))._1 shouldBe Seq(a.id)
+    val p = announce(h, us, Some(a.id), pTxs)
+    h.applyInputBlock(p) shouldBe None
+    h.bestInputBlock().map(_.id) shouldBe Some(p.id)
+    h.bestInputBlocksChain() shouldBe Seq(a.id)
+    val built = candidate(h, us, unclesSettings)
+    built.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) shouldBe Some(p.id)
+    val inWindow = built.copy(candidateBlock = built.candidateBlock.copy(inputBlockTransactions = windowTxs))
+    val current = built.copy(candidateBlock = built.candidateBlock.copy(timestamp = built.candidateBlock.timestamp + 1))
+    h.applyInputBlockTransactions(p.id, pTxs, us)._1 shouldBe Seq(p.id)
+    (h, inWindow, current, p.id)
+  }
+
+  property("solution on a candidate built before its parent's body was processed, repeating it, is refused") {
+    val pTx = spend(boxes(1))
+    val (h, inWindow, current, p) = builtInWindow(Seq(pTx), Seq(pTx))
+    h.chainTransactionsThrough(Some(p)).map(_.id) should contain(pTx.id)
+    val (block, _) = CandidateGenerator.completeInputBlock(inWindow.candidateBlock, solution)
+
+    // as the current candidate
+    CandidateGenerator.judgeInputSolution(inWindow, Seq.empty, solution, minedOn(block.id), prefixOf(h)) match {
+      case RepeatsPrefixTransactions(sbi) => sbi.id shouldBe block.id
       case other => fail(s"expected a refusal, got $other")
     }
-    // the current candidate and no candidate, for completeness
-    CandidateGenerator.judgeInputSolution(current, Seq(older), solution, minedOn(currentBlock.id), best) match {
+    // as an earlier candidate
+    CandidateGenerator.judgeInputSolution(current, Seq(inWindow), solution, minedOn(block.id), prefixOf(h)) match {
+      case RepeatsPrefixTransactions(sbi) => sbi.id shouldBe block.id
+      case other => fail(s"expected a refusal, got $other")
+    }
+  }
+
+  property("solution on a candidate built in that window is accepted when its parent carried no transactions") {
+    val (h, inWindow, current, _) = builtInWindow(Seq.empty, Seq(spend(boxes(1))))
+    val (block, _) = CandidateGenerator.completeInputBlock(inWindow.candidateBlock, solution)
+    val (currentBlock, _) = CandidateGenerator.completeInputBlock(current.candidateBlock, solution)
+
+    CandidateGenerator.judgeInputSolution(inWindow, Seq.empty, solution, minedOn(block.id), prefixOf(h)) match {
+      case MinedOnCurrentCandidate(sbi, _) => sbi.id shouldBe block.id
+      case other => fail(s"expected the current candidate, got $other")
+    }
+    // an earlier candidate on the current best input block, repeating nothing: accepted (round 3 refused it)
+    CandidateGenerator.judgeInputSolution(current, Seq(inWindow), solution, minedOn(block.id), prefixOf(h)) match {
+      case MinedOnEarlierCandidate(sbi, _) => sbi.id shouldBe block.id
+      case other => fail(s"expected an earlier candidate, got $other")
+    }
+    CandidateGenerator.judgeInputSolution(current, Seq(inWindow), solution, minedOn(currentBlock.id),
+      prefixOf(h)) match {
       case MinedOnCurrentCandidate(sbi, _) => sbi.id shouldBe currentBlock.id
       case other => fail(s"expected the current candidate, got $other")
     }
-    CandidateGenerator.judgeInputSolution(current, Seq(older), solution, minedOn(bytesToId(Array.fill(32)(9.toByte))),
-      best) shouldBe NoCandidateForInputSolution
+    CandidateGenerator.judgeInputSolution(current, Seq(inWindow), solution, minedOn(bytesToId(Array.fill(32)(9.toByte))),
+      prefixOf(h)) shouldBe NoCandidateForInputSolution
   }
 
   property("input solution on an earlier candidate is accepted if its parent is an earlier block") {
@@ -183,11 +222,9 @@ class CandidateGeneratorUnclesSpec extends ErgoCorePropertyTest with InputBlockU
     process(h, us, c, Seq(spend(boxes(3))))._1 shouldBe Seq(c.id)
     val current = candidate(h, us, unclesSettings)
     current.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) shouldBe Some(c.id)
-    val best = h.bestInputBlock().map(_.id)
-    best shouldBe Some(c.id)
+    h.bestInputBlock().map(_.id) shouldBe Some(c.id)
 
-    val minedOnOlder = (header: Header, _: Parameters) => header.id == olderBlock.id
-    CandidateGenerator.judgeInputSolution(current, Seq(older), solution, minedOnOlder, best) match {
+    CandidateGenerator.judgeInputSolution(current, Seq(older), solution, minedOn(olderBlock.id), prefixOf(h)) match {
       case MinedOnEarlierCandidate(sbi, _) =>
         sbi.id shouldBe olderBlock.id
         sbi.prevInputBlockId shouldBe Some(b.id)
@@ -195,6 +232,20 @@ class CandidateGeneratorUnclesSpec extends ErgoCorePropertyTest with InputBlockU
         h.isSiblingAnnouncement(sbi) shouldBe true
       case other => fail(s"expected an acceptance, got $other")
     }
+  }
+
+  property("a candidate on the node's own input block waits until that block's body is processed") {
+    val own = bytesToId(Array.fill(32)(4.toByte))
+    val other = bytesToId(Array.fill(32)(5.toByte))
+    val since = 1000000L
+    val waitMs = CandidateGenerator.OwnInputBlockWait.toMillis
+    // own block selected, not processed yet: wait
+    CandidateGenerator.waitForOwnInputBlock(Some(own -> since), Some(own), Seq(other), since + 10) shouldBe true
+    // processed, another block selected, no own block pending, or waited long enough: assemble
+    CandidateGenerator.waitForOwnInputBlock(Some(own -> since), Some(own), Seq(own, other), since + 10) shouldBe false
+    CandidateGenerator.waitForOwnInputBlock(Some(own -> since), Some(other), Seq(other), since + 10) shouldBe false
+    CandidateGenerator.waitForOwnInputBlock(None, Some(own), Seq.empty, since + 10) shouldBe false
+    CandidateGenerator.waitForOwnInputBlock(Some(own -> since), Some(own), Seq.empty, since + waitMs) shouldBe false
   }
 
   property("uncles disabled: no uncles field, version 1 announcement, same candidate cache key as the base") {
