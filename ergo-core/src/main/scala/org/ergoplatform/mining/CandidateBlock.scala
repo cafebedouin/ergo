@@ -2,7 +2,8 @@ package org.ergoplatform.mining
 
 import io.circe.Encoder
 import io.circe.syntax._
-import org.ergoplatform.modifiers.history.extension.Extension.{InputBlockTransactionsDigestKey, InputBlockUnclesKey, PrevInputBlockIdKey, PreviousInputBlockTransactionsDigestKey}
+import org.ergoplatform.modifiers.history.extension.Extension.{InputBlockTransactionsDigestKey, InputBlockUnclesKey,
+  PrevInputBlockIdKey, PreviousInputBlockTransactionsDigestKey}
 import org.ergoplatform.modifiers.history.extension.ExtensionCandidate
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
@@ -89,12 +90,12 @@ object CandidateBlock {
       "transactionsNumber" -> c.transactions.length.asJson,
       "votes" -> Algos.encode(c.votes).asJson,
       "extensionHash" -> Algos.encode(c.extension.digest).asJson,
-      "inputBlockFields" -> Map(
+      // uncle ids only when the candidate references uncles, otherwise as without uncles support
+      "inputBlockFields" -> (Map(
         "prevInputBlockId" -> c.inputBlockFields.prevInputBlockId.map(Algos.encode).asJson,
         "transactionsDigest" -> Algos.encode(c.inputBlockFields.transactionsDigest).asJson,
-        "prevTransactionsDigest" -> Algos.encode(c.inputBlockFields.prevTransactionsDigest).asJson,
-        "uncleIds" -> c.inputBlockFields.uncleIds.map(_.map(Algos.encode)).asJson
-      ).asJson,
+        "prevTransactionsDigest" -> Algos.encode(c.inputBlockFields.prevTransactionsDigest).asJson
+      ) ++ c.inputBlockFields.uncleIds.map(ids => "uncleIds" -> ids.map(Algos.encode).asJson).toList).asJson,
       "inputBlockTransactionIds" -> c.inputBlockTransactions.map(tx => Algos.encode(tx.id)).asJson,
       "orderingBlockTransactionIds" -> c.orderingBlockTransactions.map(tx => Algos.encode(tx.id)).asJson
     ).asJson)
