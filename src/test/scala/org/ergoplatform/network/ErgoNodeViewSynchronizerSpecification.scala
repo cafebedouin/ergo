@@ -4888,4 +4888,51 @@ class ErgoNodeViewSynchronizerSpecification
     }
   }
 
+  property("NodeViewSynchronizer: a requested BlockTransactions rebuilt from an ordering-block announcement is not " +
+    "judged invalid when the peer's copy arrives") {
+    withFixture2 { ctx =>
+      import ctx._
+      import org.ergoplatform.nodeView.LocallyGeneratedBlockSection
+      import org.ergoplatform.modifiers.history.BlockTransactions
+
+      deliveryTracker.reset()
+      // the view holder's own history instance: a second ErgoHistory on the same directory would keep its own caches
+      val viewProbe = TestProbe("ViewProbe")
+      nodeViewHolderMockRef.tell(GetDataFromCurrentView[UtxoState, ErgoHistory](_.history), viewProbe.ref)
+      val hist = viewProbe.expectMsgType[ErgoHistory](10.seconds)
+
+      // a genesis and a next block whose transactions the view holder's genesis state accepts
+      val (us, bh) = createUtxoState(ctx.settings)
+      val genesis = validFullBlock(parentOpt = None, us, bh)
+      (genesis.header +: genesis.blockSections).foreach(s => nodeViewHolderMockRef ! LocallyGeneratedBlockSection(s))
+      eventually(timeout(10.seconds)) {
+        hist.bestFullBlockOpt.map(_.id) shouldBe Some(genesis.id)
+      }
+      val afterGenesis = WrappedUtxoState(us, bh, ctx.settings).applyModifier(genesis)(_ => ()).get
+      val block = validFullBlock(Some(genesis), afterGenesis)
+      val bt: BlockTransactions = block.blockTransactions
+
+      // the announcement carries every transaction, so the view holder rebuilds the block's BlockTransactions itself
+      // (header, extension, then the rebuilt body), as a Matrix follower does for an announced ordering block
+      val oba = OrderingBlockAnnouncement(
+        OrderingBlockAnnouncement.CurrentVersion,
+        block.header,
+        nonBroadcastedTransactions = bt.txs,
+        broadcastedTransactionIds = Seq.empty,
+        extensionFields = block.extension.fields
+      )
+      nodeViewHolderMockRef ! ProcessOrderingBlock(oba)
+      eventually(timeout(10.seconds)) {
+        hist.contains(bt.id) shouldBe true
+        hist.bestFullBlockOpt.map(_.id) shouldBe Some(block.id)
+      }
+      ncProbe.receiveWhile(1.second) { case m => m }
+
+      // the body requested from a peer when the header was appended is answered after the rebuild applied it, and
+      // before the synchronizer handled the applied-modifier event: the copy is a duplicate, not an invalid modifier
+      replyForHeldModifier(deliveryTracker, synchronizerMockRef, ncProbe, peer, hist, bt)
+      hist.bestFullBlockOpt.map(_.id) shouldBe Some(block.id)
+    }
+  }
+
 }
