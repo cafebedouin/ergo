@@ -208,7 +208,15 @@ class CandidateGenerator(
       // cached candidate stale
       lazy val selectedUncles =
         if (ergoSettings.nodeSettings.inputBlockUncles) state.hr.uncleCandidates() else Seq.empty
-      if (!forced && cachedFor(state.cachedCandidate, txsToInclude, effectiveMinerPk,
+      // uncles enabled: no candidate is assembled on the node's own new input block before its body is processed
+      // (the mempool still holds its transactions); the request is retried shortly, as when no candidate can be made
+      if (ergoSettings.nodeSettings.inputBlockUncles && waitForOwnInputBlock(state.ownPendingInputBlock,
+          selectedInputBlockId, state.hr.bestInputBlocksChain(), System.currentTimeMillis())) {
+        log.debug(s"Candidate waits for the body of own input block ${selectedInputBlockId.getOrElse("")}")
+        senderOpt.foreach { s =>
+          context.system.scheduler.scheduleOnce(OwnInputBlockRetry, self, gen)(context.system.dispatcher, s)
+        }
+      } else if (!forced && cachedFor(state.cachedCandidate, txsToInclude, effectiveMinerPk,
         selectedInputBlockId, selectedInputTransactionsDigest, selectedUncles)) {
         senderOpt.foreach(_ ! StatusReply.success(state.cachedCandidate.get))
       } else {
@@ -299,28 +307,32 @@ class CandidateGenerator(
             // With uncles enabled, the solution is judged against the candidate it was mined on: the current one
             // or an earlier one on the same parent. A block from an earlier candidate links an input block which
             // may no longer be the tip, so it becomes a sibling which later input blocks can reference as an uncle.
-            val earlier = if (ergoSettings.nodeSettings.inputBlockUncles) state.previousCandidates else Nil
+            // A solution (on the current or an earlier candidate) whose transactions repeat the prefix's, e.g. on
+            // a candidate assembled before its parent's body was processed, is refused (uncles enabled only).
+            val unclesEnabled = ergoSettings.nodeSettings.inputBlockUncles
+            val earlier = if (unclesEnabled) state.previousCandidates else Nil
             val powScheme = ergoSettings.chainSettings.powScheme
-            val bestInputBlockId = state.hr.bestBlocks._2.map(_.id)
+            val prefixTransactions: Option[ModifierId] => Seq[ErgoTransaction] =
+              if (unclesEnabled) (parent => state.hr.chainTransactionsThrough(parent)) else (_ => Seq.empty)
             judgeInputSolution(state.cachedCandidate.get, earlier, solution, powScheme.checkInputBlockPoW,
-              bestInputBlockId) match {
+              prefixTransactions) match {
               case MinedOnCurrentCandidate(sbi, sbt) => // check PoW only
                 log.info(s"Input-block ${sbi.id} mined @ height ${sbi.header.height}!")
                 sendInputToNodeView(sbi, sbt)
                 context.become(initialized(state.copy(
                   cachedCandidate = None,
-                  previousCandidates = withPrevious(state.cachedCandidate, state.previousCandidates))))
+                  previousCandidates = withPrevious(state.cachedCandidate, state.previousCandidates),
+                  ownPendingInputBlock = if (unclesEnabled) Some(sbi.id -> System.currentTimeMillis()) else None)))
                 StatusReply.success(())
               case MinedOnEarlierCandidate(sbi, sbt) =>
                 // mined on an earlier candidate: the current candidate stays
                 log.info(s"Input-block ${sbi.id} mined @ height ${sbi.header.height} on an earlier candidate")
                 sendInputToNodeView(sbi, sbt)
                 StatusReply.success(())
-              case EarlierCandidateOnBestParent(sbi) =>
-                // built on the current best input block before the miner's previous block applied its
-                // transactions, so it repeats them: refused, as without uncles support
-                log.warn(s"Input-block solution ${sbi.id} fits an earlier candidate on the current best input block " +
-                  s"${bestInputBlockId.getOrElse("None")}, refused")
+              case RepeatsPrefixTransactions(sbi) =>
+                // its own node would reject it as a double spend: refused, as a non-fitting solution is
+                log.warn(s"Input-block solution ${sbi.id} repeats transactions of its parent ${sbi.prevInputBlockId} " +
+                  s"or of the chain before it, refused")
                 StatusReply.error(
                   new Exception(s"Invalid input block! PoW valid: false")
                 )
@@ -389,7 +401,9 @@ object CandidateGenerator extends ScorexLogging {
     mpr: ErgoMemPoolReader,
     avgGenTime: FiniteDuration, // approximation of average block generation time for more efficient retries
     lastAppliedBlockTxs: Option[(ModifierId, Set[ModifierId])], // header id and tx ids of the last applied block
-    subscribers: Set[ActorRef] // mining threads that get every new default candidate as soon as it is built
+    subscribers: Set[ActorRef], // mining threads that get every new default candidate as soon as it is built
+    // uncles enabled: the node's own last input block and when it was mined, see waitForOwnInputBlock
+    ownPendingInputBlock: Option[(ModifierId, Long)] = None
   )
 
   def apply(
@@ -1396,43 +1410,69 @@ object CandidateGenerator extends ScorexLogging {
   case class MinedOnCurrentCandidate(sbi: InputBlockAnnouncement, sbt: InputBlockTransactionsData)
     extends InputSolutionVerdict
 
-  /** Mined on an earlier candidate whose parent is not the current best input block: accepted, a sibling */
+  /** Mined on an earlier candidate, repeating nothing: accepted (a sibling if its parent is no longer the tip) */
   case class MinedOnEarlierCandidate(sbi: InputBlockAnnouncement, sbt: InputBlockTransactionsData)
     extends InputSolutionVerdict
 
-  /** Mined on an earlier candidate whose parent is the current best input block: refused */
-  case class EarlierCandidateOnBestParent(sbi: InputBlockAnnouncement) extends InputSolutionVerdict
+  /** Mined on a candidate whose transactions share an input box with its prefix: refused */
+  case class RepeatsPrefixTransactions(sbi: InputBlockAnnouncement) extends InputSolutionVerdict
 
   /** Fits no candidate: refused */
   case object NoCandidateForInputSolution extends InputSolutionVerdict
 
   /**
     * Judges an input-block solution against the current candidate and the earlier ones (newest first; empty with
-    * uncles disabled, which gives the handling without uncles support).
+    * uncles disabled).
     *
-    * A solution found on an earlier candidate is accepted only if that candidate's parent is not the current best
-    * input block. A candidate on the current best input block was built before the miner's previous block applied
-    * its transactions, so it repeats them: the node would reject it as a double spend, and as it would never become
-    * best it would never be relayed either. Such a solution is refused, as without uncles support. A candidate on
-    * an earlier block gives a sibling, which later input blocks can reference as an uncle.
+    * The candidate found is accepted only if its own (input-block) transactions share no input box with
+    * `prefixTransactions(parent)`: the transactions of the chain through the candidate's parent, as processed or
+    * stored by the time the solution arrives. A candidate assembled on the node's own new input block before that
+    * block's body was processed, while the mempool still held its transactions, repeats them; its own node would
+    * reject the block as a double spend. A candidate whose parent carried no transactions, or which repeats none,
+    * is accepted, on the current candidate or an earlier one. With uncles disabled `prefixTransactions` is empty,
+    * which gives the handling without uncles support.
     *
-    * @param bestInputBlockId - the current best input block (None if none: then a candidate without a parent is the
-    *                           one on the current best)
+    * The check is the input-box test of `doublespend` (one set lookup per input instead of a scan per
+    * transaction).
     */
   def judgeInputSolution(current: Candidate,
                          earlier: Seq[Candidate],
                          solution: AutolykosSolution,
                          powValid: (Header, Parameters) => Boolean,
-                         bestInputBlockId: Option[ModifierId]): InputSolutionVerdict = {
+                         prefixTransactions: Option[ModifierId] => Seq[ErgoTransaction]): InputSolutionVerdict = {
     inputSolutionCandidate(current +: earlier, solution, powValid) match {
-      case Some((c, sbi, sbt)) if c eq current => MinedOnCurrentCandidate(sbi, sbt)
       case Some((c, sbi, sbt)) =>
-        if (c.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) == bestInputBlockId) {
-          EarlierCandidateOnBestParent(sbi)
+        val prefix = prefixTransactions(c.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId))
+        val spent = prefix.flatMap(_.inputs.map(i => bytesToId(i.boxId))).toSet
+        val repeats = c.candidateBlock.inputBlockTransactions.exists(_.inputs.exists(i => spent.contains(bytesToId(i.boxId))))
+        if (repeats) {
+          RepeatsPrefixTransactions(sbi)
+        } else if (c eq current) {
+          MinedOnCurrentCandidate(sbi, sbt)
         } else {
           MinedOnEarlierCandidate(sbi, sbt)
         }
       case None => NoCandidateForInputSolution
+    }
+  }
+
+  /** At most this long, a candidate on the node's own new input block waits for that block's body to be processed */
+  val OwnInputBlockWait: FiniteDuration = 1.second
+
+  /** Retry delay of a candidate request waiting for the node's own input block */
+  val OwnInputBlockRetry: FiniteDuration = 20.millis
+
+  /**
+    * Whether a candidate request waits (uncles enabled): the input block a new candidate would build on is the
+    * node's own last input block (`pending`, with when it was mined), its body is not processed yet (it is not in
+    * `processedChain`), and it was mined less than `OwnInputBlockWait` ago.
+    */
+  def waitForOwnInputBlock(pending: Option[(ModifierId, Long)],
+                           selectedInputBlockId: Option[ModifierId],
+                           processedChain: Seq[ModifierId],
+                           now: Long): Boolean = {
+    pending.exists { case (id, since) =>
+      selectedInputBlockId.contains(id) && !processedChain.contains(id) && now - since < OwnInputBlockWait.toMillis
     }
   }
 
