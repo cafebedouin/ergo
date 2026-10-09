@@ -12,7 +12,8 @@ credited or not. Everything is behind the existing node setting `ergo.node.input
 
 **Round 1 (7ad049247), verified by the maintainer on GitHub:** compiles as written, all new specs green over 2
 repeats, existing specs match the baseline, and a mutation crediting nothing turns all 9 credit-asserting
-properties red. **Rounds 2 and 3 (see the end of this file) were not compiled or run here either.**
+properties red. Round 3 was verified on GitHub and rechecked on the network (18 runs). **Rounds 2 to 4 (see the end of this
+file) were not compiled or run here either; round 4 in particular is uncompiled.**
 
 **Round 1 was written without compiling or running anything here.** The session had no sbt, and Maven Central was blocked
 by the network proxy (HTTP 403). The code was written by reading the surrounding types.
@@ -147,8 +148,12 @@ For comparison, the starting branch (8a5b9f25c) was 20 files, +2044 / −108 aga
    - Input solutions (flag on) are judged against the current candidate, then the previous ones on the same
      parent. A block mined on an earlier candidate is sent to the node view, where it is a sibling, is relayed,
      and can be referenced. With the flag off only the current candidate is tried, as on the base.
-   - Since round 3, a solution on an earlier candidate is accepted only if that candidate's parent is **not** the
-     current best input block; otherwise it is refused as on the base (`judgeInputSolution`, see Round 3).
+   - Since round 4, a solution (on the current or an earlier candidate) is refused only if the candidate's own
+     transactions share an input box with the chain through its parent; otherwise it is accepted
+     (`judgeInputSolution`, see Round 4, which replaces round 3's refusal of earlier candidates on the best input
+     block).
+   - Since round 4, no candidate is assembled on the node's own new input block before its body is processed
+     (`waitForOwnInputBlock`, at most 1 s).
 7. **Sibling announcement relay.**
    - The trigger, `isSiblingAnnouncement`, is computed before the announcement is stored: the announcement is
      not known yet, it belongs to the best ordering block, and its parent (or the ordering block, for a first
@@ -258,7 +263,10 @@ For comparison, the starting branch (8a5b9f25c) was 20 files, +2044 / −108 aga
 | --- | --- |
 | field round-trip, binding to the extension proof | `InputBlockUnclesSpec`: round trip, malformed, "version 2 announcement repeats committed uncles…", "announced uncles other than the committed ones are not committed", "proof is unchanged…" |
 | generator references a seen PoW-valid sibling, block validates | `CandidateGeneratorUnclesSpec`: "generator references a seen PoW-valid sibling…" |
-| solution on an earlier candidate: refused on the best parent, accepted on an earlier block (round 3) | `CandidateGeneratorUnclesSpec`: "input solution on an earlier candidate is refused if its parent is the current best input block", "… is accepted if its parent is an earlier block" |
+| solution repeating its prefix refused, otherwise accepted (round 4, replaces round 3) | `CandidateGeneratorUnclesSpec`: "solution on a candidate built before its parent's body was processed, repeating it, is refused", "solution on a candidate built in that window is accepted when its parent carried no transactions", "input solution on an earlier candidate is accepted if its parent is an earlier block" |
+| no candidate on the own unprocessed block (round 4) | `CandidateGeneratorUnclesSpec`: "a candidate on the node's own input block waits until that block's body is processed" |
+| sibling bodies on demand (round 4) | `InputBlockUnclesSpecification`: "sibling body not wanted; a later child of it is…", "uncles disabled: every body wanted…", "switch to the sibling's fork applies once its late bodies arrive" (both orders); `ErgoNodeViewSynchronizerSpecification`: "uncles enabled, a sibling's transactions are fetched only once a child needs them", "uncles disabled, … fetched on its announcement (base)" |
+| own siblings relayed, credited by peers (round 4) | `ErgoNodeViewHolderUnclesSpec`: "own-mined input block that does not become best is announced to peers" (+ flag off); `InputBlockUnclesSpecification`: "a block whose body failed on its miner is still credited by a peer…" |
 | K = 2, by arrival, not already credited | `CandidateGeneratorUnclesSpec`: "generator takes at most two siblings, by arrival…"; `InputBlockUnclesSpecification`: "uncle candidates…" |
 | three ids / malformed length / self-reference / duplicate | `InputBlockUnclesSpecification`: "three ids…", "malformed length…", "self-reference…", "duplicate id…" (+ ergo-core "field rule") |
 | uncle from another ordering block / parent not on chain / already credited / unknown | `InputBlockUnclesSpecification`: "uncle from another ordering block…", "uncle whose parent is not on the chain, or which is on the chain…", "uncle already credited to an ancestor…", "unknown id…; credited once the sibling's announcement arrives" |
@@ -302,11 +310,15 @@ processed. This is base fork handling, unchanged here.
 5. **Relay gap** (confirmed by the maintainer). The first child of a parent is relayed only if it becomes the best
    input block, through the base path. A first child whose transactions never arrive, so that it never becomes
    best, is not relayed as a sibling. Later competitors are relayed. "First" is per node: it depends on the
-   order in which that node received the announcements.
+   order in which that node received the announcements. **Since round 4** an own-mined block that does not
+   become best is announced too, which closes the gap for the miner's own blocks (all disagreements observed).
+   A received first child that never becomes best is still not relayed by this node.
 6. **Uncle depth** is bounded only by the ordering block: an uncle's parent may be any ancestor. Ethereum bounds
    it (6 generations). Whether a bound is wanted depends on the reward answer.
-7. **The base receive path** fetches sibling transactions on announcement (see deviations). Whether siblings
-   should be announcement-only end to end is a protocol choice for the base.
+7. **The base receive path** fetches sibling transactions on announcement (see deviations). **Since round 4** a
+   flag-on node does not (see Round 4); flag-off nodes still do.
+10. **Credit does not check a sibling's transactions** (round 4): a sibling repeating its parent's transactions is
+    credited. See Round 4, item 1.
 8. **The cost of `refreshUncleCredits`** grows with the number of input blocks per ordering block. If needed,
    recompute only the blocks whose chain contains the new announcement's parent, or which reference it.
 9. `InputBlocksProcessor.scala` was already over the 800-line style limit on the base (1269 lines). It is now
@@ -357,7 +369,7 @@ One change in `CandidateGenerator`'s handling of an input-block solution, no des
   powValid, bestInputBlockId)`, which the actor calls. It returns one of four verdicts:
   - `MinedOnCurrentCandidate`
   - `MinedOnEarlierCandidate`
-  - `EarlierCandidateOnBestParent` (refused)
+  - `EarlierCandidateOnBestParent` (refused; replaced in round 4 by `RepeatsPrefixTransactions`)
   - `NoCandidateForInputSolution`
 
   With the flag off, `earlier` is empty, so only the first and last verdicts occur, exactly as on the base.
@@ -369,8 +381,184 @@ One change in `CandidateGenerator`'s handling of an input-block solution, no des
   - "input solution on an earlier candidate is accepted if its parent is an earlier block". Also checks that the
     accepted block is a sibling announcement.
 
+*Superseded by round 4:* the blanket refusal is replaced by a transaction check, and the first spec above was
+rewritten (see Round 4).
+
 Spec to run for round 3:
 
 ```
 sbt "testOnly org.ergoplatform.mining.CandidateGeneratorUnclesSpec org.ergoplatform.mining.CandidateGeneratorSpec org.ergoplatform.mining.ErgoMinerSpec org.ergoplatform.mining.ErgoMiningThreadSpec"
+```
+
+## Round 4
+
+Three causes behind the remaining costs, found by offline diagnosis of the round 3 network runs (18 runs, below
+the cap, external miner). All changes are flag-gated: with the flag off the code paths are the base's.
+
+### 1. Candidate built before the miner's own block is processed
+
+**Observed:**
+- The generator assembled a candidate a few ms after the node stored its own input block but before that
+  block's body was processed, while the mempool still held the block's transactions. The candidate's parent is
+  the new block, and it repeats the parent's transactions.
+- A solution on it fails "Double spending" on its own miner. In one run the failed block stayed the tip, a peer
+  fetched it as a parent and failed it too, and both nodes stalled 46 s.
+- 11.2 % of own blocks were assembled in this window with the flag on (2.6 % on the base).
+- Round 3's refusals were almost all candidates from this window: about 79 % would have failed, about 21 %
+  (parent without transactions) were valid and were refused.
+- 0.7 to 7.8 % of credited siblings repeat their own parent's transactions.
+
+**Choices:**
+- **Transaction check instead of round 3's refusal.**
+  - `judgeInputSolution(current, earlier, solution, powValid, prefixTransactions)` stays the pure decision
+    point. The candidate the solution fits (current or earlier) is refused (`RepeatsPrefixTransactions`) if its
+    own input-block transactions share an input box with `prefixTransactions(parent)`. Otherwise it is accepted
+    (`MinedOnCurrentCandidate` / `MinedOnEarlierCandidate`).
+  - The actor passes `chainTransactionsThrough(parent)`, the stored bodies of the chain from the first input
+    block of the ordering block through the candidate's parent, read when the solution arrives. By then the
+    parent's body is normally processed.
+  - *Why the input-box check and not the digest comparison:* comparing the candidate's previous-transactions
+    digest with the current prefix digest would refuse every candidate whose prefix changed, including those
+    that repeat nothing (the 21 % above). The input-box check refuses exactly what the node would reject as
+    "Double spending" against the prefix.
+  - It is the test of `CandidateGenerator.doublespend`, done with one set of the prefix's spent box ids instead
+    of a scan per transaction.
+  - It does not catch other kinds of invalidity, which were not observed.
+  - With the flag off, the prefix function returns nothing and earlier candidates are not considered, so the
+    handling is the base's.
+- **No candidate on the own block before its body is processed.**
+  - The generator remembers its own last accepted input block and when it was mined (`ownPendingInputBlock`).
+  - While a new candidate would build on that block (`bestBlocks._2`) and the block is not in the processed best
+    chain, a candidate request is not assembled. It is rescheduled every 20 ms, as the base already does when no
+    candidate can be made, for at most `OwnInputBlockWait` = 1 s (`waitForOwnInputBlock`).
+  - After that the candidate is assembled anyway, so a block whose body fails cannot stall the miner forever
+    (that case is now also prevented by the check above).
+  - Requests are not answered during the wait: the internal miner keeps mining its previous candidate, and an
+    external miner's request waits for up to 1 s.
+  - *What the base would need:* the same window exists there (2.6 %).
+    - Either the same wait without the flag,
+    - or the node view holder must make the new tip visible to readers only after its body is processed. For a
+      local block, process the body before inserting the announcement into the tree (or insert and process
+      atomically with respect to readers), and remove the block's transactions from the mempool before readers
+      see the new tip.
+    - The base also builds ordering-block candidates in this window with an L that lacks the parent's
+      transactions.
+- **Credit and a sibling repeating its parent's transactions: left as an open question.** Credit is header-level
+  by design.
+  - Checking a sibling's transactions needs the sibling's body, which item 2 deliberately stops fetching, and
+    its parent's body.
+  - A check made only when the bodies happen to be present would make credit depend on what each node fetched,
+    adding disagreement between nodes (item 3's problem).
+  - The announcement's weak transaction ids (only for blocks of at most 3 transactions) are not enough to decide
+    either.
+  - The source observed was miners' own candidates from the window above. With the check above, an honest flag-on
+    miner no longer produces such blocks, but a peer's could still be credited.
+  - The spec "credit does not check a sibling's transactions: one repeating its parent's is credited" documents
+    the behaviour.
+
+**Specs** (`CandidateGeneratorUnclesSpec`):
+- "solution on a candidate built before its parent's body was processed, repeating it, is refused", as the
+  current and as an earlier candidate.
+- "solution on a candidate built in that window is accepted when its parent carried no transactions", as the
+  current and as an earlier candidate on the current best input block (refused in round 3), plus the
+  no-candidate verdict.
+- "input solution on an earlier candidate is accepted if its parent is an earlier block" (kept).
+- "a candidate on the node's own input block waits until that block's body is processed" (the pure wait rule).
+- The window is reproduced in the fixture: P's announcement is stored, the candidate is built on P before P's
+  body is processed, and the candidate's input-block transactions are set to P's to stand in for the mempool
+  that still held them. P's body is then processed before the solution is judged.
+
+### 2. Sibling transactions fetched though only the announcement is needed
+
+**Observed:** all of the extra input-block bytes (1.45 to 1.73× the base) came from credited siblings, about half
+their relayed announcements and half their transaction fetches. The fetch path is
+`processInputBlock` → `resolveInputBlockTransactions` (or `requestInputBlockTransactionIds`), with no best-chain
+check.
+
+**Choices:**
+- `InputBlocksProcessor.inputBlockBodyWanted(ib)`, called by the synchronizer:
+  - With the flag off, or for another ordering block than the best one: always (base).
+  - Otherwise the body is wanted when any of the following holds:
+    - the block's depth (its known chain plus one) is greater than the length of the processed best chain, so it
+      extends the best chain or makes a sibling branch long enough for the fork choice to switch;
+    - its chain is not known yet;
+    - a known block already builds on it.
+  - A sibling not meeting this is handed to the node view holder as an announcement only. No transaction ids or
+    transactions are requested and the mempool is not consulted.
+- **Fetched later when needed.** When a wanted announcement arrives, the bodies of its stored ancestors without a
+  body (`bodilessAncestors`, nearest first, up to the first with a body) are requested from the same peer, and
+  its own body is requested as before. A child of a sibling therefore fetches the sibling's body.
+- **Fork switch.**
+  - A switch to the sibling's fork needs a longer branch, so it always involves such a child, and the fetch
+    above.
+  - The base fork choice judges by the depth of the block whose body has just arrived. If the child's body
+    arrives before the sibling's, the base would never switch.
+  - With the flag on, `applyInputBlockTransactions` therefore processes the deepest descendant with a body again
+    when a body arrives without progress, and the switch happens in either order.
+- **Costs:**
+  - A reorg onto a sibling branch waits for the bodies: one more round trip for the sibling's, requested from the
+    peer that sent the child. If that peer lacks it (a flag-on peer that has not fetched it either), the request
+    goes unanswered and is not retried, so the switch waits for the next block on that branch.
+  - The node cannot serve a sibling's transactions or transaction ids it never fetched. A flag-off peer asking it
+    for them gets no answer (logged, no penalty).
+  - Ordering-block reconstruction is the base's (from the best chain). An ordering block linking a sibling branch
+    whose bodies were not fetched cannot be rebuilt and falls back to the full download.
+  - The node's mempool and wallet do not see a sibling's transactions until they are fetched.
+- The relay of sibling announcements (round 1) is unchanged: announcements still travel. Only the bodies are no
+  longer fetched.
+
+**Specs:**
+- `InputBlockUnclesSpecification`:
+  - "sibling body not wanted; a later child of it is, and its body-less ancestors are fetched";
+  - "uncles disabled: every body wanted, no ancestor fetch (base behaviour)";
+  - "switch to the sibling's fork applies once its late bodies arrive", the child's body first and the sibling's
+    first.
+- `ErgoNodeViewSynchronizerSpecification`, through `processInputBlock` with PoW-valid announcements and a flag-on
+  synchronizer (`Synchronizer2Fixture` now takes the flag):
+  - "uncles enabled, a sibling's transactions are fetched only once a child needs them": no request on the
+    sibling's announcement, then requests for the sibling and the child on the child's;
+  - "uncles disabled, a sibling's transactions are fetched on its announcement (base)".
+
+### 3. A miner credits its own siblings that its peers never received
+
+**Observed:** every credit disagreement between nodes (81 pairs in one run set) was a node crediting an uncle it
+mined itself, whose announcement was never sent on any link (open question 5's gap).
+
+**Choice: relay them.**
+- With the flag on, the node view holder announces an own-mined input block that did not become the best one
+  after its body was handled (`NewInputBlockSibling`, local). This covers a block that lost its parent position
+  or whose body failed. The announcement goes out by id, as for other siblings: peers request the announcement,
+  and with item 2 they do not fetch its body.
+- A block announced as a sibling on arrival, or that became best, was announced already and is not announced
+  again.
+- *Why not "reference only relayed or received siblings":* that would drop the credit for the miner's own work
+  that this branch exists to measure, and it would still leave the peers without the announcement. Relaying
+  costs one Inv per such block, plus one announcement for each peer that requests it.
+
+**Specs:**
+- `ErgoNodeViewHolderUnclesSpec`: "own-mined input block that does not become best is announced to peers". Here
+  its body fails. The flag-off control asserts that it is not announced.
+- `InputBlockUnclesSpecification`: "a block whose body failed on its miner is still credited by a peer that
+  received its announcement".
+
+### Not compiled
+
+Nothing of round 4 was compiled or run here. sbt is unavailable and Maven Central is blocked (HTTP 403). Places
+worth a first look if the build fails:
+- `CandidateGenerator`:
+  - the parenthesised function literals in the `if` that chooses `prefixTransactions`;
+  - the `if … else if (!forced && cachedFor(…)) … else` chain in `GenerateCandidate`;
+  - the new field `ownPendingInputBlock` with a default value at the end of `CandidateGeneratorState`.
+- `InputBlocksProcessor`: the nested `@tailrec` local functions in `knownAncestry` and `bodilessAncestors`.
+- `ErgoNodeViewSynchronizer`: `if (!bodyWanted) {…} else weakTxIdsOpt match {…}`.
+- `ErgoNodeViewSynchronizerSpecification`:
+  - `Synchronizer2Fixture(inputBlockUncles: Boolean = false)`, constructed as `new Synchronizer2Fixture(uncles)`;
+  - the local `object helpers` mixing in `InputBlockUnclesTestHelpers`.
+
+### Spec classes to run
+
+```
+sbt "testOnly org.ergoplatform.mining.CandidateGeneratorUnclesSpec org.ergoplatform.nodeView.history.modifierprocessors.InputBlockUnclesSpecification org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderUnclesSpec org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification"
+sbt "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorConcurrencySpecification org.ergoplatform.mining.CandidateGeneratorSpec org.ergoplatform.mining.CandidateRetryReorgSpec org.ergoplatform.mining.ErgoMiningThreadSpec org.ergoplatform.mining.ErgoMinerSpec org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec org.ergoplatform.network.InputBlockParentBindingSpec org.ergoplatform.network.OrderingBlockMessageFlowSpec org.ergoplatform.settings.ErgoSettingsSpecification org.ergoplatform.http.routes.BlocksApiRouteSpec"
+sbt "ergoCore/testOnly org.ergoplatform.mining.InputBlockUnclesSpec"
 ```
