@@ -1,5 +1,9 @@
 # Input-block uncles prototype: design notes
 
+> On branch `matrix-uncles-header` the transaction-merging design below is superseded by header-level uncles
+> (references for credit only); see `HEADER-NOTES.md`. These notes describe the starting branch
+> `claude/ergo-input-uncles-i9lxmj` (8a5b9f25c) and are kept for reference.
+
 Branch `claude/ergo-input-uncles-i9lxmj`, created from `matrix-uncles-base` (80f638555). Prototype of
 "chain + uncles" for Matrix input blocks: a later input block may merge up to two siblings ("uncles") of
 elements of its chain, so that their transactions are collected and their work counts, while the chain depth
