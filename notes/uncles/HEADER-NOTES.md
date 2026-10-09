@@ -12,7 +12,8 @@ credited or not. Everything is behind the existing node setting `ergo.node.input
 
 **Round 1 (7ad049247), verified by the maintainer on GitHub:** compiles as written, all new specs green over 2
 repeats, existing specs match the baseline, and a mutation crediting nothing turns all 9 credit-asserting
-properties red. Round 3 was verified on GitHub and rechecked on the network (18 runs). **Rounds 2 to 4 (see the end of this
+properties red. Round 3 was verified on GitHub and rechecked on the network (18 runs). Round 4 was verified on GitHub (compiled with no fixes, new specs green, no regression, each change killed by
+a mutant). **Rounds 2 to 5 (see the end of this
 file) were not compiled or run here either; round 4 in particular is uncompiled.**
 
 **Round 1 was written without compiling or running anything here.** The session had no sbt, and Maven Central was blocked
@@ -498,9 +499,12 @@ check.
 - **Costs:**
   - A reorg onto a sibling branch waits for the bodies: one more round trip for the sibling's, requested from the
     peer that sent the child. If that peer lacks it (a flag-on peer that has not fetched it either), the request
-    goes unanswered and is not retried, so the switch waits for the next block on that branch.
+    goes unanswered and is not retried, so the switch waits for the next block on that branch. *Corrected in
+    round 5:* that was wrong. The next block walked back only to the nearest ancestor with a body, so it did not
+    ask again, and the node stayed on the shorter chain until the next ordering block. See Round 5, A.
   - The node cannot serve a sibling's transactions or transaction ids it never fetched. A flag-off peer asking it
-    for them gets no answer (logged, no penalty).
+    for them gets no answer (logged, no penalty). *Changed in round 5:* the body is now fetched on demand and the
+    peer is answered then. See Round 5, B.
   - Ordering-block reconstruction is the base's (from the best chain). An ordering block linking a sibling branch
     whose bodies were not fetched cannot be rebuilt and falls back to the full download.
   - The node's mempool and wallet do not see a sibling's transactions until they are fetched.
@@ -530,7 +534,8 @@ mined itself, whose announcement was never sent on any link (open question 5's g
   or whose body failed. The announcement goes out by id, as for other siblings: peers request the announcement,
   and with item 2 they do not fetch its body.
 - A block announced as a sibling on arrival, or that became best, was announced already and is not announced
-  again.
+  again. *Changed in round 5:* an own block is announced only if its transactions apply on its own prefix, and
+  only after its body was handled. See Round 5, C.
 - *Why not "reference only relayed or received siblings":* that would drop the credit for the miner's own work
   that this branch exists to measure, and it would still leave the peers without the announcement. Relaying
   costs one Inv per such block, plus one announcement for each peer that requests it.
@@ -559,6 +564,126 @@ worth a first look if the build fails:
 
 ```
 sbt "testOnly org.ergoplatform.mining.CandidateGeneratorUnclesSpec org.ergoplatform.nodeView.history.modifierprocessors.InputBlockUnclesSpecification org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderUnclesSpec org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification"
+sbt "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorConcurrencySpecification org.ergoplatform.mining.CandidateGeneratorSpec org.ergoplatform.mining.CandidateRetryReorgSpec org.ergoplatform.mining.ErgoMiningThreadSpec org.ergoplatform.mining.ErgoMinerSpec org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec org.ergoplatform.network.InputBlockParentBindingSpec org.ergoplatform.network.OrderingBlockMessageFlowSpec org.ergoplatform.settings.ErgoSettingsSpecification org.ergoplatform.http.routes.BlocksApiRouteSpec"
+sbt "ergoCore/testOnly org.ergoplatform.mining.InputBlockUnclesSpec"
+```
+
+## Round 5
+
+Round 4 was verified on GitHub: it compiled with no fixes, the new specs were green over 2 repeats, there was no
+regression against the stack baseline, and each of the three changes was killed by a mutant. A code read then
+found three liveness gaps. All fixes are flag-gated: with the flag off the code paths are the base's.
+
+### A. A lost sibling body was never requested again
+
+**Gap** (confirmed by the maintainer with a local test):
+- If the single request for sibling S's body went unanswered (the peer lacked it or left), each later block on
+  that branch walked back only as far as S's child, which had its body. S was never asked for again, and a second
+  announcement of S is ignored as already known.
+- The node stayed on the shorter chain until the next ordering block, whose reconstruction then fell back to the
+  full download.
+- The round 4 note saying the switch "waits for the next block on that branch" was wrong; it is corrected above.
+
+**Change:**
+- `bodilessAncestors` walks back through **all** known ancestors of the same ordering block, up to the first input
+  block, past those that have their body. It returns every one without a body, nearest first.
+- When a wanted block arrives, each of them is requested from the peer that sent that block, which built on them
+  and is usually a different peer than the one that failed. This happens through
+  `ErgoNodeViewSynchronizer.requestInputBlockBodyBounded`, at most `MaxInputBlockBodyRequests` = 3 times per input
+  block, counting every request.
+- A lost request is therefore retried by each later descendant, up to the bound. The node does not remember which
+  peer failed: if the same peer sends the next descendant, it is asked again.
+- Once the sibling's body arrives, round 4's late-body retry processes the deepest descendant with a body, and the
+  fork choice switches.
+- The counters are kept in the synchronizer, bounded to the latest `MaxTrackedInputBlocks` = 1024 input blocks.
+- *Remaining:* after 3 lost requests the node waits for the next ordering block, as before.
+
+**Specs:**
+- `ErgoNodeViewSynchronizerSpecification`:
+  - "uncles, a lost sibling body is requested again from the peer of a later descendant": S's request to
+    `peer` is not answered, T (child of S) gets its body, U (child of T) arrives from another peer, S is requested
+    from that peer, and the switch to A, S, T happens when S's body arrives;
+  - "uncles, re-requests of a missing sibling body are bounded".
+- `InputBlockUnclesSpecification`: "body-less ancestors are found behind ancestors that have their body".
+
+### B. Mixed networks: flag-off peers could not get a body-less sibling
+
+**Gap:** the base asks for an input block's transactions once, with no timeout, retry or penalty. A flag-on node
+relays (and serves on request) the announcement of a sibling whose body it never fetched. A flag-off peer asking
+it for the transactions got nothing. If a block later built on that sibling, the flag-off node could not follow
+until the next ordering block.
+
+**Choice: the alternative, fetch on demand and answer late.**
+- When a peer asks for the transaction ids of an input block whose announcement is stored but whose body is not,
+  the synchronizer remembers the peer and requests the body from the peer that announced the sibling. That peer
+  is recorded when the sibling was processed as an announcement only. The request is bounded as in A.
+- When the body is stored, the node view holder publishes `InputBlockBodyStored(id)`, and every waiting peer is
+  answered. Because the base requester waits without a timeout, the late answer is used.
+- *Why not the recommended option*, which relays a sibling announcement to a peer only if the node holds its body
+  or the peer is known to be flag-on:
+  - "Known flag-on" can only be guessed. A flag-on node sends version 2 announcements only when it references
+    uncles, so most flag-on peers would look flag-off.
+  - It would cover the relay only. Announcements are also served on request, for example as the unknown parent of
+    a later block, and that path would still hand out body-less siblings.
+  - The on-demand fetch covers every path, needs no capability guess, and fetches a body only when someone
+    actually asks for it.
+- *Costs:*
+  - The asking peer gets the body one round trip later.
+  - If the announcer cannot provide it, the asker waits until the next ordering block, as before. This happens
+    after 3 requests, or when the announcer is unknown: for example the sibling's announcement came through the
+    view holder from a peer this synchronizer did not record, or the record fell out of the 1024-entry bound.
+  - The waiting peers and the announcers are kept bounded like the counters.
+
+**Specs** (`ErgoNodeViewSynchronizerSpecification`):
+- "uncles, a peer asking for a body-less sibling's transactions gets them after an on-demand fetch": nothing is
+  sent to the asker at first, and the body is requested from the announcer; after the body is stored and
+  `InputBlockBodyStored` is received, the asker gets `InputBlockTransactionIdsData` for S.
+- "uncles disabled, a request for unknown transaction ids is not answered nor fetched (base)".
+- `ErgoNodeViewHolderUnclesSpec`: "a stored input block body is signalled (on-demand body requests wait for it)",
+  and no signal with the flag off.
+
+### C. The own-block relay spread blocks whose body failed
+
+**Gap:** round 4 announced every own block that did not become best, including one whose body failed. A
+same-depth peer then fetched it and failed it too, which is the shape of the 46 s two-node stall seen in round 3.
+
+**Change:**
+- With the flag on, after an own block's body was handled, the block is announced as a sibling only if it is not
+  in the best chain and its transactions apply on its own prefix. The check is `ErgoState.applyInputBlock(txs,
+  chainTransactionsThrough(parent), header)` on the node's state, the same validation the processor runs. A
+  digest-mode node fails this check, so it does not announce.
+- An own block whose transactions fail is never announced.
+- The round 1 announcement of an own block that was a sibling on arrival is removed for own blocks, so that every
+  own sibling goes through this check, after its body. Received siblings are still announced on arrival, as in
+  round 1.
+
+**Specs** (`ErgoNodeViewHolderUnclesSpec`):
+- "own-mined input block that applied but lost its position is announced to peers": Y, a peer's child of A, was
+  processed first.
+- "own-mined input block whose transactions fail is not announced".
+- "uncles disabled: own-mined input block that does not become best is not announced (base behaviour)".
+
+### Not compiled
+
+Nothing of round 5 was compiled or run here (no sbt; Maven Central blocked). Places worth a first look if the
+build fails:
+- `ErgoNodeViewSynchronizer`:
+  - the generic `putBounded[V]` on `mutable.LinkedHashMap`;
+  - the guarded `case None if …` in `processInputBlockTransactionIdsRequest`.
+- `ErgoNodeViewHolder`: `Try(minimalState().applyInputBlock(…)).flatten`.
+- `ErgoNodeViewSynchronizerSpecification`: `withBodilessSibling`, with its seven-parameter function and the
+  `SendToNetwork(msg, SendToPeer(p))` patterns.
+
+**Fixture risk:** the round 5 synchronizer specs send announcements made by `InputBlockUnclesTestHelpers.announceOn`
+through `processInputBlock`. These are header copies whose extension root was changed. The test PoW scheme
+accepts any ordering-block header, but the input-block PoW check (`checkInputBlockPoW`) is real and runs against
+the test difficulty. I expect it to pass for any header at that difficulty, but this was not run. If those
+announcements are rejected as invalid (penalty messages), that is the cause.
+
+### Spec classes to run
+
+```
+sbt "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderUnclesSpec org.ergoplatform.nodeView.history.modifierprocessors.InputBlockUnclesSpecification org.ergoplatform.mining.CandidateGeneratorUnclesSpec"
 sbt "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorConcurrencySpecification org.ergoplatform.mining.CandidateGeneratorSpec org.ergoplatform.mining.CandidateRetryReorgSpec org.ergoplatform.mining.ErgoMiningThreadSpec org.ergoplatform.mining.ErgoMinerSpec org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec org.ergoplatform.network.InputBlockParentBindingSpec org.ergoplatform.network.OrderingBlockMessageFlowSpec org.ergoplatform.settings.ErgoSettingsSpecification org.ergoplatform.http.routes.BlocksApiRouteSpec"
 sbt "ergoCore/testOnly org.ergoplatform.mining.InputBlockUnclesSpec"
 ```
