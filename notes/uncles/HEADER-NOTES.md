@@ -13,7 +13,8 @@ credited or not. Everything is behind the existing node setting `ergo.node.input
 **Round 1 (7ad049247), verified by the maintainer on GitHub:** compiles as written, all new specs green over 2
 repeats, existing specs match the baseline, and a mutation crediting nothing turns all 9 credit-asserting
 properties red. Round 3 was verified on GitHub and rechecked on the network (18 runs). Round 4 was verified on GitHub (compiled with no fixes, new specs green, no regression, each change killed by
-a mutant). **Rounds 2 to 5 (see the end of this
+a mutant). Round 5 likewise (zero compile fixes, specs green over 2 repeats, no regression, each fix killed by
+its mutant). **Rounds 2 to 6 (see the end of this
 file) were not compiled or run here either; round 4 in particular is uncompiled.**
 
 **Round 1 was written without compiling or running anything here.** The session had no sbt, and Maven Central was blocked
@@ -633,6 +634,8 @@ until the next ordering block.
     after 3 requests, or when the announcer is unknown: for example the sibling's announcement came through the
     view holder from a peer this synchronizer did not record, or the record fell out of the 1024-entry bound.
   - The waiting peers and the announcers are kept bounded like the counters.
+  - *Gap (fixed in round 6):* only the transaction-ids request was covered, not the request for specific
+    transactions. See Round 6.
 
 **Specs** (`ErgoNodeViewSynchronizerSpecification`):
 - "uncles, a peer asking for a body-less sibling's transactions gets them after an on-demand fetch": nothing is
@@ -679,6 +682,78 @@ through `processInputBlock`. These are header copies whose extension root was ch
 accepts any ordering-block header, but the input-block PoW check (`checkInputBlockPoW`) is real and runs against
 the test difficulty. I expect it to pass for any header at that difficulty, but this was not run. If those
 announcements are rejected as invalid (penalty messages), that is the cause.
+
+### Spec classes to run
+
+```
+sbt "testOnly org.ergoplatform.network.ErgoNodeViewSynchronizerSpecification org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderUnclesSpec org.ergoplatform.nodeView.history.modifierprocessors.InputBlockUnclesSpecification org.ergoplatform.mining.CandidateGeneratorUnclesSpec"
+sbt "testOnly org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorSpecification org.ergoplatform.nodeView.history.modifierprocessors.InputBlockProcessorConcurrencySpecification org.ergoplatform.mining.CandidateGeneratorSpec org.ergoplatform.mining.CandidateRetryReorgSpec org.ergoplatform.mining.ErgoMiningThreadSpec org.ergoplatform.mining.ErgoMinerSpec org.ergoplatform.nodeView.viewholder.ErgoNodeViewHolderSpec org.ergoplatform.network.InputBlockParentBindingSpec org.ergoplatform.network.OrderingBlockMessageFlowSpec org.ergoplatform.settings.ErgoSettingsSpecification org.ergoplatform.http.routes.BlocksApiRouteSpec"
+sbt "ergoCore/testOnly org.ergoplatform.mining.InputBlockUnclesSpec"
+```
+
+## Round 6
+
+Round 5 was verified on GitHub: zero compile fixes, all specs green over 2 repeats, no regression against the stack
+baseline, and each fix killed by its mutant.
+
+### R5-B1: the request for specific transactions was not covered
+
+**Gap:** the base requests an input block's body in two ways:
+- *Transaction ids*, when the announcement carries no weak ids. Round 5's on-demand fetch covered this request.
+- *Specific transactions*, when the announcement carries weak ids. This is the common case: the generator writes
+  weak ids for all transactions, only the local push of a best block strips them above 3, and stored
+  announcements are served as stored. The peer resolves what it can from its mempool and sends an
+  `InputBlockTransactionsRequest` for the rest.
+
+The handler for the second request, `processInputBlockTransactionsRequest`, was unchanged. A flag-on node without
+the body neither answered nor fetched. A sibling whose transactions a flag-off peer lacked in its mempool, for
+example because they were already in its chain, was therefore unreachable for that peer.
+
+**Change** (flag on only):
+- `processInputBlockTransactionsRequest`: when the input block's announcement is stored but its body is not, the
+  request is kept, the body is fetched on demand, and the requested subset is sent once the body is stored. When
+  the body is stored, the request is answered as before. With the flag off, or for an unknown block, nothing
+  changes.
+- Both request kinds go through one path, `awaitBodyOnDemand`, and share one attempt budget
+  (`MaxInputBlockBodyRequests` = 3 per block). That budget is also shared with the fetches triggered by a later
+  descendant (round 5, A).
+- Each kept request remembers its kind: `PendingTransactionIds(peer)` or `PendingTransactions(peer, request)`. On
+  `InputBlockBodyStored` each kept request is answered by the handler of its kind.
+- *Optional item, done:* every peer that announces such a sibling is remembered, up to `MaxSiblingAnnouncers` = 4.
+  That includes a peer announcing it again after it is known: its announcement is otherwise ignored, but it is now
+  recorded as a source. On-demand attempts go to these peers in turn, attempt n to peer n mod k, so a departed
+  first announcer cannot use up all 3 attempts.
+- Peers that only sent an `Inv` for the known block are not recorded. The node did not request the announcement
+  from them, so it cannot tell whether they hold the body.
+
+**Remaining:**
+- Once 3 attempts are spent, or when no announcer is known, waiting requests stay unanswered until the next
+  ordering block, as before.
+- A kept request for specific transactions is not deduplicated by content (its weak ids are byte arrays), so a peer
+  repeating the same request may be answered twice. That is harmless.
+
+**Specs** (`ErgoNodeViewSynchronizerSpecification`):
+- "uncles, a peer requesting specific transactions of a body-less sibling gets them after an on-demand fetch":
+  - nothing is sent to the asker at first, and the body is requested from the announcer;
+  - after S's body (one transaction) is stored and `InputBlockBodyStored` is received, the asker gets
+    `InputBlockTransactionsData` with exactly that transaction.
+- "uncles, on-demand fetches go to the other peers that announced the sibling in turn": S is announced again by a
+  second peer. A transaction-ids request fetches from the first announcer, and the next request, for specific
+  transactions, fetches from the second.
+- "uncles disabled, a request for transactions of an unknown body is not answered nor fetched (base)".
+- `withBodilessSibling` takes S's transactions (default none, as in round 5).
+
+### Not compiled
+
+Nothing of round 6 was compiled or run here (no sbt; Maven Central blocked). Places worth a first look if the
+build fails:
+- in the `ErgoNodeViewSynchronizer` companion: the sealed `PendingBodyRequest` with its two case classes;
+- `Vector` values in the `putBounded` maps;
+- the pattern match on the companion's case classes in the `InputBlockBodyStored` handler;
+- in the spec: the class-level `private object round6` that mixes in the helpers.
+
+Round 5's fixture risk applies here too: the announcements that `announceOn` modifies must pass the real
+input-block PoW check at the test difficulty.
 
 ### Spec classes to run
 
