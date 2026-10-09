@@ -923,6 +923,14 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
 
       val inputBlockTxs = subBlockTransactionsData.transactions
       processInputBlockTransactions(subblockInfo.id, inputBlockTxs, local = true)
+
+      // with input-block uncles enabled, an own block which did not become the best one (it lost its parent
+      // position, or its body failed) is announced as a sibling, so that peers have it and can credit it too
+      // (a best one was announced by NewBestInputBlock, a sibling at arrival above)
+      if (settings.nodeSettings.inputBlockUncles && !sibling && history().getInputBlock(subblockInfo.id).isDefined &&
+        !history().bestInputBlocksChain().contains(subblockInfo.id)) {
+        context.system.eventStream.publish(NewInputBlockSibling(subblockInfo.id, local = true))
+      }
   }
 
   protected def getCurrentInfo: Receive = {

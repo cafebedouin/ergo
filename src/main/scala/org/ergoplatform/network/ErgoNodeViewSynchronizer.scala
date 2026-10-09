@@ -1573,7 +1573,20 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
         log.info(s"Processing valid sub-block $subBlockId with parent sub-block $prevSbIdOpt and parent block ${subBlockHeader.parentId}, weak txs announced: ${weakTxIdsOpt.map(_.length)}")
 
-        weakTxIdsOpt match {
+        // input-block uncles enabled: a sibling is processed as an announcement only, its transactions are fetched
+        // once needed (a block building on it arrives); always fetched with uncles disabled
+        val bodyWanted = hr.inputBlockBodyWanted(inputBlockInfo)
+        if (bodyWanted) {
+          hr.bodilessAncestors(inputBlockInfo).foreach { ancestor =>
+            log.info(s"Fetching transactions of ${ancestor.id}, an ancestor of input block $subBlockId, from $remote")
+            requestInputBlockTransactionIds(ancestor, remote)
+          }
+        }
+
+        if (!bodyWanted) {
+          log.info(s"Sibling input block $subBlockId: announcement only, transactions not fetched")
+          viewHolderRef ! ProcessInputBlock(inputBlockInfo, remote)
+        } else weakTxIdsOpt match {
           case Some(wIds) =>
             resolveInputBlockTransactions(subBlockId, wIds, mp, remote)(
               onReady = { mempoolTxs =>
