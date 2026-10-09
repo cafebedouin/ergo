@@ -337,4 +337,16 @@ class InputBlockUnclesSpecification extends ErgoCorePropertyTest with InputBlock
     h.chainTransactionsThrough(Some(a.id)).map(_.id) shouldBe Seq(spend(boxes(0)).id)
   }
 
+  // Round 5, item A: all body-less ancestors, not only the nearest ones
+
+  property("body-less ancestors are found behind ancestors that have their body") {
+    val (h, us, a, _, s, t) = siblingBranchWithoutBodies()
+    // T gets its body, S's request was lost
+    h.applyInputBlockTransactions(t.id, Seq(spend(boxes(3))), us) shouldBe (Seq.empty -> Seq.empty)
+    val u = announce(h, us, Some(t.id), Seq(spend(boxes(4))))
+    h.inputBlockBodyWanted(u) shouldBe true
+    h.bodilessAncestors(u).map(_.id) shouldBe Seq(s.id)
+    h.bodilessAncestors(announce(h, us, Some(a.id), Seq.empty)) shouldBe Seq.empty
+  }
+
 }

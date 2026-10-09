@@ -73,11 +73,12 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
   }
 
   /**
-    * Round 4, item 3: the node mines X (child of A) itself, but X does not become the best input block (here its
-    * body fails, as a candidate repeating its parent's transactions did). Before, it was relayed only on becoming
-    * best, so peers never had it, while the miner itself could credit it.
+    * Own-mined X (child of A) that does not become the best input block. Round 4 announced it whatever its body;
+    * round 5 announces it only if its body applies on its own prefix: it lost its position (here Y, a peer's child
+    * of A, was processed first), not when its body fails (here it spends a box that does not exist), as peers
+    * would fetch it and fail it too.
     */
-  private def ownBlockNotBest(uncles: Boolean): Unit = {
+  private def ownBlockNotBest(uncles: Boolean, bodyApplies: Boolean): Unit = {
     new NodeViewFixture(nodeSettings(uncles), parameters).apply { fixture =>
       import fixture._
       val (us, bh) = createUtxoState(fixture.settings)
@@ -86,28 +87,62 @@ class ErgoNodeViewHolderUnclesSpec extends ErgoCorePropertyTest with NodeViewTes
       val wus = WrappedUtxoState(us, bh, fixture.settings).applyModifier(genesis)(_ => ()).get
 
       val a = announceOn(validFullBlock(Some(genesis), wus).header, None, Seq.empty)
-      val badTx = spend(trueBox("absent"))
-      val x = announceOn(validFullBlock(Some(genesis), wus).header, Some(a.id), Seq(badTx))
+      val y = announceOn(validFullBlock(Some(genesis), wus).header, Some(a.id), Seq.empty)
+      val xTxs = if (bodyApplies) Seq.empty else Seq(spend(trueBox("absent")))
+      val x = announceOn(validFullBlock(Some(genesis), wus).header, Some(a.id), xTxs)
 
-      subscribeEvents(classOf[NewInputBlockSibling])
       nodeViewHolderRef ! ProcessInputBlock(a, peer(fixture))
       nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(a.id, Seq.empty))
-      nodeViewHolderRef ! LocallyGeneratedInputBlock(x, InputBlockTransactionsData(x.id, Seq(badTx)))
-      if (uncles) {
+      nodeViewHolderRef ! ProcessInputBlock(y, peer(fixture))
+      nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(y.id, Seq.empty))
+      subscribeEvents(classOf[NewInputBlockSibling])
+      nodeViewHolderRef ! LocallyGeneratedInputBlock(x, InputBlockTransactionsData(x.id, xTxs))
+      if (uncles && bodyApplies) {
         testProbe.expectMsg(10.seconds, NewInputBlockSibling(x.id, local = true))
       }
       testProbe.expectNoMessage(1.second)
+      getHistory.bestInputBlocksChain() shouldBe Seq(y.id, a.id)
       getHistory.getInputBlock(x.id).isDefined shouldBe true
-      getHistory.bestInputBlocksChain() should not contain x.id
     }
   }
 
-  property("own-mined input block that does not become best is announced to peers") {
-    ownBlockNotBest(uncles = true)
+  property("own-mined input block that applied but lost its position is announced to peers") {
+    ownBlockNotBest(uncles = true, bodyApplies = true)
+  }
+
+  property("own-mined input block whose transactions fail is not announced") {
+    ownBlockNotBest(uncles = true, bodyApplies = false)
   }
 
   property("uncles disabled: own-mined input block that does not become best is not announced (base behaviour)") {
-    ownBlockNotBest(uncles = false)
+    ownBlockNotBest(uncles = false, bodyApplies = true)
+  }
+
+  private def bodyStoredEvent(uncles: Boolean): Unit = {
+    new NodeViewFixture(nodeSettings(uncles), parameters).apply { fixture =>
+      import fixture._
+      val (us, bh) = createUtxoState(fixture.settings)
+      val genesis = validFullBlock(parentOpt = None, us, bh)
+      applyBlock(genesis).isSuccess shouldBe true
+      val wus = WrappedUtxoState(us, bh, fixture.settings).applyModifier(genesis)(_ => ()).get
+      val a = announceOn(validFullBlock(Some(genesis), wus).header, None, Seq.empty)
+
+      subscribeEvents(classOf[InputBlockBodyStored])
+      nodeViewHolderRef ! ProcessInputBlock(a, peer(fixture))
+      nodeViewHolderRef ! ProcessInputBlockTransactions(InputBlockTransactionsData(a.id, Seq.empty))
+      if (uncles) {
+        testProbe.expectMsg(10.seconds, InputBlockBodyStored(a.id))
+      }
+      testProbe.expectNoMessage(1.second)
+    }
+  }
+
+  property("a stored input block body is signalled (on-demand body requests wait for it)") {
+    bodyStoredEvent(uncles = true)
+  }
+
+  property("uncles disabled: no body-stored signal (base behaviour)") {
+    bodyStoredEvent(uncles = false)
   }
 
 }

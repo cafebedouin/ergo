@@ -1449,6 +1449,150 @@ class ErgoNodeViewSynchronizerSpecification
     }
   }
 
+  /**
+    * Round 5 fixture (input-block uncles): A, B processed with empty bodies in a history with the flag given, S
+    * (child of A) a sibling stored without body, received from `peer`. Announcements are made with
+    * `InputBlockUnclesTestHelpers.announceOn` (header copies committing to their own extension; the test PoW
+    * accepts them). `test` gets the context, the history, the state, a fresh-header maker and A, B, S.
+    */
+  private def withBodilessSibling(uncles: Boolean)
+                                 (test: (Synchronizer2Fixture, ErgoHistory, WrappedUtxoState, Int => Header,
+                                   InputBlockAnnouncement, InputBlockAnnouncement, InputBlockAnnouncement) => Any): Unit = {
+    withFixture2Uncles(uncles) { ctx =>
+      import ctx._
+      import org.ergoplatform.utils.generators.ChainGenerator.applyBlock
+      object helpers extends org.ergoplatform.utils.InputBlockUnclesTestHelpers with Matchers
+
+      val hist = ErgoHistory.readOrGenerate(settings)(null)
+      val wrappedState = boxesHolderGen
+        .map(WrappedUtxoState(_, createTempDir, parameters, settings))
+        .sample
+        .get
+      val mempool = ErgoMemPool.empty(settings)
+      synchronizerMockRef ! ChangedState(wrappedState)
+      synchronizerMockRef ! ChangedHistory(hist)
+      synchronizerMockRef ! ChangedMempool(mempool)
+      Thread.sleep(500)
+
+      val chain = genChain(1, hist)
+      applyBlock(hist, chain.head)
+      val baseHeader = buildValidInputBlockAnnouncement(Some(chain.head)).header
+      val header = (k: Int) => baseHeader.copy(timestamp = baseHeader.timestamp + k)
+
+      val a = helpers.announceOn(header(1), None, Seq.empty)
+      val b = helpers.announceOn(header(2), Some(a.id), Seq.empty)
+      Seq(a, b).foreach { ib =>
+        hist.applyInputBlock(ib) shouldBe None
+        hist.applyInputBlockTransactions(ib.id, Seq.empty, wrappedState)._1 shouldBe Seq(ib.id)
+      }
+      val s = helpers.announceOn(header(3), Some(a.id), Seq.empty)
+      synchronizerMockRef.underlyingActor.processInputBlock(s, hist, mempool, peer, Some(wrappedState))
+      // the node view holder is a separate instance here: store S in this history by hand
+      hist.applyInputBlock(s) shouldBe None
+      hist.getInputBlockTransactionIds(s.id) shouldBe None
+      ncProbe.receiveWhile(max = 1.second, idle = 300.millis) { case m => m }
+      test(ctx, hist, wrappedState, header, a, b, s)
+    }
+  }
+
+  /** Input block ids whose transaction ids were requested, with the peer asked */
+  private def bodyRequests(probe: TestProbe): Seq[(ModifierId, ConnectedPeer)] = {
+    import org.ergoplatform.modifiers.InputBlockTransactionIdsTypeId
+    import scorex.core.network.SendToPeer
+    probe.receiveWhile(max = 1.second, idle = 300.millis) { case m => m }.collect {
+      case SendToNetwork(msg, SendToPeer(p)) if msg.spec.messageCode == RequestModifierSpec.messageCode =>
+        msg.data.toOption.collect {
+          case inv: InvData if inv.typeId == InputBlockTransactionIdsTypeId.value => inv.ids.map(_ -> p)
+        }.getOrElse(Seq.empty)
+    }.flatten
+  }
+
+  property("NodeViewSynchronizer: uncles, a lost sibling body is requested again from the peer of a later descendant") {
+    withBodilessSibling(uncles = true) { (ctx, hist, wrappedState, header, a, b, s) =>
+      import ctx._
+      object helpers extends org.ergoplatform.utils.InputBlockUnclesTestHelpers with Matchers
+      val mempool = ErgoMemPool.empty(settings)
+      val peer2 = ConnectedPeer(connectionIdGen.sample.get, pchProbe.ref, Some(peerInfo))
+      val sync = synchronizerMockRef.underlyingActor
+
+      // T (child of S) from `peer`: S's body is requested from it, and never answered
+      val t = helpers.announceOn(header(4), Some(s.id), Seq.empty)
+      sync.processInputBlock(t, hist, mempool, peer, Some(wrappedState))
+      bodyRequests(ncProbe) should contain(s.id -> peer)
+      hist.applyInputBlock(t) shouldBe None
+      hist.applyInputBlockTransactions(t.id, Seq.empty, wrappedState) shouldBe (Seq.empty -> Seq.empty)
+
+      // U (child of T) from another peer: S, behind T which has its body, is requested again, from that peer
+      val u = helpers.announceOn(header(5), Some(t.id), Seq.empty)
+      sync.processInputBlock(u, hist, mempool, peer2, Some(wrappedState))
+      bodyRequests(ncProbe) should contain(s.id -> peer2)
+
+      // S's body arrives: the fork choice switches to A, S, T
+      hist.applyInputBlockTransactions(s.id, Seq.empty, wrappedState) shouldBe (Seq(s.id, t.id) -> Seq(b.id))
+      hist.bestInputBlocksChain() shouldBe Seq(t.id, s.id, a.id)
+    }
+  }
+
+  property("NodeViewSynchronizer: uncles, re-requests of a missing sibling body are bounded") {
+    withBodilessSibling(uncles = true) { (ctx, hist, wrappedState, header, _, _, s) =>
+      import ctx._
+      object helpers extends org.ergoplatform.utils.InputBlockUnclesTestHelpers with Matchers
+      val mempool = ErgoMemPool.empty(settings)
+      // children of S, one after the other: each walks back to S
+      val requests = (4 to 9).flatMap { k =>
+        val child = helpers.announceOn(header(k), Some(s.id), Seq.empty)
+        synchronizerMockRef.underlyingActor.processInputBlock(child, hist, mempool, peer, Some(wrappedState))
+        bodyRequests(ncProbe)
+      }
+      requests.count(_._1 == s.id) shouldBe ErgoNodeViewSynchronizer.MaxInputBlockBodyRequests
+    }
+  }
+
+  property("NodeViewSynchronizer: uncles, a peer asking for a body-less sibling's transactions gets them after an on-demand fetch") {
+    withBodilessSibling(uncles = true) { (ctx, hist, wrappedState, _, _, _, s) =>
+      import ctx._
+      import org.ergoplatform.network.message.inputblocks.{InputBlockTransactionIdsData, InputBlockTransactionIdsMessageSpec}
+      import scorex.core.network.SendToPeer
+      // a flag-off peer: the base asks for transaction ids once, with no timeout
+      val flagOffPeer = ConnectedPeer(connectionIdGen.sample.get, pchProbe.ref, Some(peerInfo))
+      val sync = synchronizerMockRef.underlyingActor
+
+      sync.processInputBlockTransactionIdsRequest(s.id, hist, flagOffPeer)
+      // nothing to answer yet: the body is fetched from the peer that announced S
+      val fetch = ncProbe.receiveWhile(max = 1.second, idle = 300.millis) { case m => m }
+      fetch.exists {
+        case SendToNetwork(msg, SendToPeer(p)) => msg.spec.messageCode == InputBlockTransactionIdsMessageSpec.messageCode && p == flagOffPeer
+        case _ => false
+      } shouldBe false
+      fetch.exists {
+        case SendToNetwork(msg, SendToPeer(p)) =>
+          p == peer && msg.spec.messageCode == RequestModifierSpec.messageCode &&
+            msg.data.toOption.exists { case inv: InvData => inv.ids.contains(s.id); case _ => false }
+        case _ => false
+      } shouldBe true
+
+      // the body arrives and is stored: the waiting peer is answered
+      hist.applyInputBlockTransactions(s.id, Seq.empty, wrappedState)
+      hist.getInputBlockTransactionIds(s.id) shouldBe Some(Seq.empty)
+      synchronizerMockRef ! InputBlockBodyStored(s.id)
+      val answer = ncProbe.fishForMessage(3.seconds) {
+        case SendToNetwork(msg, SendToPeer(p)) => p == flagOffPeer && msg.spec.messageCode == InputBlockTransactionIdsMessageSpec.messageCode
+        case _ => false
+      }
+      answer.asInstanceOf[SendToNetwork].message.data.get.asInstanceOf[InputBlockTransactionIdsData].inputBlockId shouldBe s.id
+    }
+  }
+
+  property("NodeViewSynchronizer: uncles disabled, a request for unknown transaction ids is not answered nor fetched (base)") {
+    withFixture2 { ctx =>
+      import ctx._
+      val hist = ErgoHistory.readOrGenerate(settings)(null)
+      synchronizerMockRef.underlyingActor.processInputBlockTransactionIdsRequest(
+        bytesToId(Array.fill(32)(7.toByte)), hist, peer)
+      ncProbe.expectNoMessage(500.millis)
+    }
+  }
+
   property(
     "NodeViewSynchronizer: NewBestInputBlock(local=true) strips txs when exactly 4 transactions"
   ) {
