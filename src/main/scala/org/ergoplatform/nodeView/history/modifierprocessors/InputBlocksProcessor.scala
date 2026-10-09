@@ -617,12 +617,13 @@ trait InputBlocksProcessor extends ScorexLogging {
           var updTree  = new InputBlocksTree(forks.updated(longestIndex, r._1))
           val updForks = updTree.forks
 
-          // Register completion for any other forks that were waiting for this block
+          // Register completion for any other forks that were waiting for this block.
+          // They share its prefix, so its cost is the one just measured.
+          val ibCost = r._1.processedBlocks(r._1.depthOf(ib.id))
           (0 until updForks.length).foreach { idx =>
             val f = updForks(idx)
             if (f.firstToComplete().contains(ib.id)) {
-              // todo: pass real cost of input block instead of costDelta = 0
-              f.registerCompletion(ib.id, costDelta = 0) match {
+              f.registerCompletion(ib.id, costDelta = ibCost) match {
                 case Success(ibc) =>
                   updTree = new InputBlocksTree(updTree.forks.updated(idx, ibc))
                 case Failure(e) =>
@@ -647,12 +648,13 @@ trait InputBlocksProcessor extends ScorexLogging {
           var updTree  = new InputBlocksTree(forks.updated(bestIndex, r._1))
           val updForks = updTree.forks
 
-          // Register completion for any other forks that were waiting for this block
+          // Register completion for any other forks that were waiting for this block.
+          // They share its prefix, so its cost is the one just measured.
+          val ibCost = r._1.processedBlocks(r._1.depthOf(ib.id))
           (0 until updForks.length).foreach { idx =>
             val f = updForks(idx)
             if (f.firstToComplete().contains(ib.id)) {
-              // todo: pass real cost of input block instead of costDelta = 0
-              f.registerCompletion(ib.id, costDelta = 0) match {
+              f.registerCompletion(ib.id, costDelta = ibCost) match {
                 case Success(ibc) =>
                   updTree = new InputBlocksTree(updTree.forks.updated(idx, ibc))
                 case Failure(e) =>
