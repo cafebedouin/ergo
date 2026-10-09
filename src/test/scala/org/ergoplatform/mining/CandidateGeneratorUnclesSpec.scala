@@ -2,21 +2,21 @@ package org.ergoplatform.mining
 
 import org.ergoplatform.AutolykosSolution
 import org.ergoplatform.mining.CandidateGenerator.Candidate
-import org.ergoplatform.modifiers.mempool.ErgoTransaction
+import org.ergoplatform.modifiers.history.extension.Extension
+import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.nodeView.history.ErgoHistory
 import org.ergoplatform.nodeView.state.UtxoState
-import org.ergoplatform.settings.{ErgoSettings, ErgoValidationSettingsUpdate}
-import org.ergoplatform.subblocks.InputBlockUncles
+import org.ergoplatform.settings.{Algos, ErgoSettings, ErgoValidationSettingsUpdate, Parameters}
+import org.ergoplatform.subblocks.{InputBlockAnnouncement, InputBlockUncles}
 import org.ergoplatform.utils.{ErgoCorePropertyTest, InputBlockUnclesTestHelpers}
-import scorex.util.{ModifierId, bytesToId}
+import scorex.crypto.authds.LeafData
+import scorex.util.bytesToId
 import sigma.crypto.CryptoConstants
 
-import scala.util.{Failure, Success, Try}
-
 /**
-  * Candidate generation with input-block uncles (node setting `inputBlockUncles`): a candidate references up to
-  * two valid, mergeable, non-conflicting siblings, and an input-block solution is judged against the candidate it
-  * was mined on.
+  * Candidate generation with header-level input-block uncles (node setting `inputBlockUncles`): a candidate
+  * references up to two PoW-valid siblings for credit, by local arrival order; their transactions are not
+  * collected. An input-block solution is judged against the candidate it was mined on.
   */
 class CandidateGeneratorUnclesSpec extends ErgoCorePropertyTest with InputBlockUnclesTestHelpers {
 
@@ -33,84 +33,28 @@ class CandidateGeneratorUnclesSpec extends ErgoCorePropertyTest with InputBlockU
     BigInt(0)
   )
 
-  private def sibling(seed: Int, txs: Seq[ErgoTransaction]): (ModifierId, Seq[ErgoTransaction]) =
-    bytesToId(Array.fill(32)(seed.toByte)) -> txs
-
-  // validation as by the state, with a fixed cost per transaction
-  private def validCost(perTx: Long)(txs: Seq[ErgoTransaction], prefix: Seq[ErgoTransaction]): Try[Long] =
-    Success(perTx * txs.size)
-
   private def candidate(h: ErgoHistory, us: UtxoState, s: ErgoSettings): Candidate = {
     CandidateGenerator.createCandidate(defaultMinerPk, h, ErgoValidationSettingsUpdate.empty, us,
       Seq.empty, None, Seq.empty, s).get._1
   }
 
-  property("selectUncles takes valid siblings oldest first, at most two") {
-    val prefix = Seq(spend(boxes(0)))
-    val candidates = Seq(
-      sibling(1, Seq(spend(boxes(1)))),
-      sibling(2, Seq(spend(boxes(2)))),
-      sibling(3, Seq(spend(boxes(3)))))
-    val (ids, txs) = CandidateGenerator.selectUncles(candidates, prefix, 10L, Long.MaxValue, Long.MaxValue, validCost(5))
-    ids shouldBe candidates.take(InputBlockUncles.MaxUncles).map(_._1)
-    txs.map(_.id) shouldBe Seq(spend(boxes(1)).id, spend(boxes(2)).id)
-  }
+  private def uncleIdsOf(c: Candidate) = c.candidateBlock.inputBlockFields.uncleIds.map(_.map(bytesToId))
 
-  property("selectUncles skips a conflicting sibling and deduplicates collected transactions") {
-    val prefix = Seq(spend(boxes(0)), spend(boxes(1)))
-    val conflicting = sibling(1, Seq(split(boxes(1))))
-    // repeats a collected transaction, adds a new one
-    val overlapping = sibling(2, Seq(spend(boxes(1)), spend(boxes(2))))
-    // conflicts with the selected sibling above, not with the prefix
-    val conflictingWithUncle = sibling(3, Seq(split(boxes(2))))
-    val (ids, txs) = CandidateGenerator.selectUncles(Seq(conflicting, overlapping, conflictingWithUncle), prefix,
-      0L, Long.MaxValue, Long.MaxValue, validCost(1))
-    ids shouldBe Seq(overlapping._1)
-    txs.map(_.id) shouldBe Seq(spend(boxes(2)).id)
-  }
+  private def hasUnclesKey(c: Candidate): Boolean =
+    c.candidateBlock.extension.fields.exists(_._1.sameElements(Extension.InputBlockUnclesKey))
 
-  property("selectUncles skips siblings which do not fit the limits or are not valid after the prefix") {
-    val prefix = Seq(spend(boxes(0)))
-    val big = sibling(1, Seq(spend(boxes(1)), spend(boxes(2))))
-    val invalid = sibling(2, Seq(spend(boxes(3))))
-    val small = sibling(3, Seq(spend(boxes(4))))
-    val validate: (Seq[ErgoTransaction], Seq[ErgoTransaction]) => Try[Long] = { (txs, prefixTxs) =>
-      if (txs.exists(_.id == spend(boxes(3)).id)) Failure(new Exception("invalid")) else validCost(10)(txs, prefixTxs)
-    }
-    // prefix costs 100, room for 15 more: the sibling with two transactions (20) does not fit, one with one (10) does
-    val (ids, _) = CandidateGenerator.selectUncles(Seq(big, invalid, small), prefix, 100L, 115L, Long.MaxValue, validate)
-    ids shouldBe Seq(small._1)
-
-    // size limit: nothing fits beyond the prefix
-    val prefixSize = prefix.map(_.size.toLong).sum
-    CandidateGenerator.selectUncles(Seq(small), prefix, 0L, Long.MaxValue, prefixSize, validCost(1))._1 shouldBe Seq.empty
-  }
-
-  property("cached candidate is stale when uncle candidates change") {
-    val (h, us) = setup()
-    val (_, _, s) = chainWithSibling(h, us, Seq(spend(boxes(2))))
-    val c = candidate(h, us, unclesSettings)
-    c.consideredUncles shouldBe Seq(s.id)
-    val tip = h.bestInputBlock().map(_.id)
-    val digest = org.ergoplatform.settings.Algos.merkleTreeRoot(
-      h.getBestOrderingCollectedInputBlocksTransactions().map(tx => scorex.crypto.authds.LeafData @@ tx.serializedId))
-    CandidateGenerator.cachedFor(Some(c), Seq.empty, defaultMinerPk, tip, digest, Seq(s.id)) shouldBe true
-    CandidateGenerator.cachedFor(Some(c), Seq.empty, defaultMinerPk, tip, digest, Seq.empty) shouldBe false
-    CandidateGenerator.cachedFor(Some(c), Seq.empty, defaultMinerPk, tip, digest,
-      Seq(s.id, bytesToId(Array.fill(32)(9.toByte)))) shouldBe false
-  }
-
-  property("generator references a waiting sibling and the resulting input block validates") {
+  property("generator references a seen PoW-valid sibling and the block validates, with the sibling credited") {
     val (h, us) = setup()
     val (a, b, s) = chainWithSibling(h, us, Seq(spend(boxes(2))))
-    h.mergeableUncleCandidates() shouldBe Seq(s.id)
+    h.uncleCandidates() shouldBe Seq(s.id)
 
     val c = candidate(h, us, unclesSettings)
     val block = c.candidateBlock
-    block.inputBlockFields.uncleIds.map(_.map(bytesToId)) shouldBe Some(Seq(s.id))
+    uncleIdsOf(c) shouldBe Some(Seq(s.id))
     block.inputBlockFields.prevInputBlockId.map(bytesToId) shouldBe Some(b.id)
-    // the ordering-block transactions start with L(B) followed by the uncle's transactions
-    block.transactions.take(3).map(_.id) shouldBe Seq(boxes(0), boxes(1), boxes(2)).map(bx => spend(bx).id)
+    // L is the base's: the collected transactions of A and B, the sibling's transaction is not collected
+    block.transactions.take(2).map(_.id) shouldBe Seq(boxes(0), boxes(1)).map(bx => spend(bx).id)
+    block.transactions.map(_.id) should not contain spend(boxes(2)).id
 
     val (sbi, sbt) = CandidateGenerator.completeInputBlock(block, solution)
     sbi.version shouldBe InputBlockUncles.UnclesMessageVersion
@@ -120,22 +64,65 @@ class CandidateGeneratorUnclesSpec extends ErgoCorePropertyTest with InputBlockU
 
     process(h, us, sbi, sbt.transactions) shouldBe (Seq(sbi.id) -> Seq.empty)
     h.bestInputBlocksChain() shouldBe Seq(sbi.id, b.id, a.id)
-    collectedIds(h).take(3) shouldBe Seq(boxes(0), boxes(1), boxes(2)).map(bx => spend(bx).id)
-    h.mergeableUncleCandidates() shouldBe Seq.empty
+    h.getCreditedUncles(sbi.id) shouldBe Seq(s.id)
+    collectedIds(h).take(2) shouldBe Seq(boxes(0), boxes(1)).map(bx => spend(bx).id)
+    collectedIds(h) should not contain spend(boxes(2)).id
+    h.uncleCandidates() shouldBe Seq.empty
   }
 
-  property("generator does not reference a conflicting sibling") {
+  property("generator takes at most two siblings, by arrival, skipping the ones credited along the chain") {
     val (h, us) = setup()
-    // valid against its own prefix, conflicts with B
-    val (_, _, s) = chainWithSibling(h, us, Seq(split(boxes(1))))
-    h.mergeableUncleCandidates() shouldBe Seq(s.id)
-    val c = candidate(h, us, unclesSettings)
-    c.consideredUncles shouldBe Seq(s.id)
-    c.candidateBlock.inputBlockFields.uncleIds.map(_.map(bytesToId)) shouldBe Some(Seq.empty)
+    val (a, b, s1) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    val c = announce(h, us, Some(b.id), Seq(spend(boxes(3))), uncles = Seq(s1.id))
+    process(h, us, c, Seq(spend(boxes(3))))._1 shouldBe Seq(c.id)
+    // S3 arrives after S2 with an earlier timestamp, S4 last
+    val s2 = announce(h, us, Some(a.id), Seq.empty)
+    val s3 = announceOn(freshInputBlockHeader(h, us).copy(timestamp = s2.header.timestamp - 100000), Some(b.id), Seq.empty)
+    val s4 = announce(h, us, Some(a.id), Seq.empty)
+    Seq(s2, s3, s4).foreach(ib => h.applyInputBlock(ib) shouldBe None)
 
-    val (sbi, sbt) = CandidateGenerator.completeInputBlock(c.candidateBlock, solution)
-    sbi.unclesCommitted shouldBe true
-    process(h, us, sbi, sbt.transactions)._1 shouldBe Seq(sbi.id)
+    val cand = candidate(h, us, unclesSettings)
+    cand.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) shouldBe Some(c.id)
+    uncleIdsOf(cand) shouldBe Some(Seq(s2.id, s3.id))
+
+    val (sbi, sbt) = CandidateGenerator.completeInputBlock(cand.candidateBlock, solution)
+    process(h, us, sbi, sbt.transactions) shouldBe (Seq(sbi.id) -> Seq.empty)
+    h.getCreditedUncles(sbi.id) shouldBe Seq(s2.id, s3.id)
+    h.uncleCandidates() shouldBe Seq(s4.id)
+  }
+
+  property("generator does not reference siblings of another ordering block or off the chain") {
+    val (h, us) = setup()
+    val (_, _, s) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    val foreign = announceOn(freshInputBlockHeader(h, us).copy(parentId = bytesToId(Array.fill(32)(3.toByte))), None,
+      Seq.empty)
+    val offChain = announce(h, us, Some(s.id), Seq.empty)
+    Seq(foreign, offChain).foreach(ib => h.applyInputBlock(ib) shouldBe None)
+    uncleIdsOf(candidate(h, us, unclesSettings)) shouldBe Some(Seq(s.id))
+  }
+
+  property("no sibling: no uncles field and a version 1 announcement") {
+    val (h, us) = setup()
+    val a = announce(h, us, None, Seq(spend(boxes(0))))
+    process(h, us, a, Seq(spend(boxes(0))))._1 shouldBe Seq(a.id)
+    val c = candidate(h, us, unclesSettings)
+    c.candidateBlock.inputBlockFields.uncleIds shouldBe None
+    hasUnclesKey(c) shouldBe false
+    CandidateGenerator.completeInputBlock(c.candidateBlock, solution)._1.version shouldBe
+      InputBlockAnnouncement.initialMessageVersion
+  }
+
+  property("cached candidate is stale when the uncle selection changes") {
+    val (h, us) = setup()
+    val (_, _, s) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    val c = candidate(h, us, unclesSettings)
+    val tip = h.bestInputBlock().map(_.id)
+    val digest = Algos.merkleTreeRoot(
+      h.getBestOrderingCollectedInputBlocksTransactions().map(tx => LeafData @@ tx.serializedId))
+    CandidateGenerator.cachedFor(Some(c), Seq.empty, defaultMinerPk, tip, digest, Seq(s.id)) shouldBe true
+    CandidateGenerator.cachedFor(Some(c), Seq.empty, defaultMinerPk, tip, digest, Seq.empty) shouldBe false
+    CandidateGenerator.cachedFor(Some(c), Seq.empty, defaultMinerPk, tip, digest,
+      Seq(s.id, bytesToId(Array.fill(32)(9.toByte)))) shouldBe false
   }
 
   property("input-block solution is judged against the candidate it was mined on") {
@@ -147,61 +134,54 @@ class CandidateGeneratorUnclesSpec extends ErgoCorePropertyTest with InputBlockU
     val (newerBlock, _) = CandidateGenerator.completeInputBlock(newer.candidateBlock, solution)
     olderBlock.id should not be newerBlock.id
 
-    val minedOnOlder = (header: org.ergoplatform.modifiers.history.header.Header, _: org.ergoplatform.settings.Parameters) =>
-      header.id == olderBlock.id
+    val minedOnOlder = (header: Header, _: Parameters) => header.id == olderBlock.id
     CandidateGenerator.inputSolutionCandidate(Seq(newer, older), solution, minedOnOlder).map(_._1) shouldBe Some(older)
-    CandidateGenerator.inputSolutionCandidate(Seq(newer, older), solution, minedOnOlder).map(_._2.id) shouldBe Some(olderBlock.id)
+    CandidateGenerator.inputSolutionCandidate(Seq(newer, older), solution, minedOnOlder).map(_._2.id) shouldBe
+      Some(olderBlock.id)
     // only the current candidate considered: not found
     CandidateGenerator.inputSolutionCandidate(Seq(newer), solution, minedOnOlder) shouldBe None
   }
 
-  property("uncles disabled: no uncles field, version 1 announcement, no uncle candidates") {
+  property("uncles disabled: no uncles field, version 1 announcement, same candidate cache key as the base") {
     val (h, us) = setup(uncles = false)
     chainWithSibling(h, us, Seq(spend(boxes(2))))
     val c = candidate(h, us, settings)
-    c.consideredUncles shouldBe Seq.empty
     c.candidateBlock.inputBlockFields.uncleIds shouldBe None
-    c.candidateBlock.extension.fields.exists(_._1.sameElements(
-      org.ergoplatform.modifiers.history.extension.Extension.InputBlockUnclesKey)) shouldBe false
+    hasUnclesKey(c) shouldBe false
     val (sbi, _) = CandidateGenerator.completeInputBlock(c.candidateBlock, solution)
-    sbi.version shouldBe org.ergoplatform.subblocks.InputBlockAnnouncement.initialMessageVersion
+    sbi.version shouldBe InputBlockAnnouncement.initialMessageVersion
     sbi.uncleIdsOpt shouldBe None
+    sbi.unparsedBytes.isEmpty shouldBe true
   }
 
-  /**
-    * Generator and validation must judge uncles against the same chain. A, B, C is processed (C merged S1), S2 is
-    * another valid sibling, and E (extending C, merging S2) is only announced: the best fork's unprocessed tail.
-    * Before the fix the generator built on E (the best fork's last element) but judged uncles against the
-    * processed chain A, B, C, so it merged S2 again and its block was invalid once E was processed ("uncle ... is
-    * merged by an earlier element"). Now it builds on C, the processed tip, and the block validates.
-    */
-  property("generator and validation agree on uncles when siblings were merged earlier and the chain has an unprocessed tail") {
+  property("mixed: a flag-on node accepts a flag-off node's input blocks") {
     val (h, us) = setup()
-    val (a, b, s1) = chainWithSibling(h, us, Seq(spend(boxes(2))))
-    val c = announce(h, us, Some(b.id), Seq(spend(boxes(3))), uncles = Seq(s1.id))
-    process(h, us, c, Seq(spend(boxes(3)))) shouldBe (Seq(c.id) -> Seq.empty)
-    val s2 = announce(h, us, Some(a.id), Seq(spend(boxes(4))))
-    process(h, us, s2, Seq(spend(boxes(4)))) shouldBe (Seq.empty -> Seq.empty)
-    h.mergeableUncleCandidates() shouldBe Seq(s2.id)
+    val (a, b, _) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    // generated by a node with uncles disabled, over the same chain
+    val c = candidate(h, us, settings)
+    hasUnclesKey(c) shouldBe false
+    val (sbi, sbt) = CandidateGenerator.completeInputBlock(c.candidateBlock, solution)
+    sbi.version shouldBe InputBlockAnnouncement.initialMessageVersion
+    process(h, us, sbi, sbt.transactions) shouldBe (Seq(sbi.id) -> Seq.empty)
+    h.bestInputBlocksChain() shouldBe Seq(sbi.id, b.id, a.id)
+    h.getCreditedUncles(sbi.id) shouldBe Seq.empty
+  }
 
-    val eTx = spend(boxes(5))
-    val e = announce(h, us, Some(c.id), Seq(eTx), uncles = Seq(s2.id))
-    h.applyInputBlock(e) shouldBe None
-    h.bestInputBlock().map(_.id) shouldBe Some(e.id)
-    h.candidateParentInputBlock().map(_.id) shouldBe Some(c.id)
-
-    val cand = candidate(h, us, unclesSettings)
-    cand.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) shouldBe Some(c.id)
-    cand.candidateBlock.inputBlockFields.uncleIds.map(_.map(bytesToId)) shouldBe Some(Seq(s2.id))
-    val (sbi, sbt) = CandidateGenerator.completeInputBlock(cand.candidateBlock, solution)
-
-    // E's transactions arrive: E is processed and merges S2
-    h.applyInputBlockTransactions(e.id, Seq(eTx), us)._1 shouldBe Seq(e.id)
-    // the produced block (a sibling of E) validates under the same uncle rule
-    h.applyInputBlock(sbi) shouldBe None
-    h.applyInputBlockTransactions(sbi.id, sbt.transactions, us)
-    h.getInputBlockValidity(sbi.id) shouldBe Some(true)
-    h.getInputBlockValidity(e.id) shouldBe Some(true)
+  property("mixed: a flag-off node parses, ignores and relays unchanged a version 2 announcement with 0x03 0x03") {
+    val (h, us) = setup(uncles = false)
+    val (a, b, s) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    // as a flag-on node announces it
+    val withUncle = announce(h, us, Some(b.id), Seq.empty, uncles = Seq(s.id))
+    val bytes = InputBlockAnnouncement.serializer.toBytes(withUncle)
+    val parsed = InputBlockAnnouncement.serializer.parseBytes(bytes)
+    parsed.version shouldBe InputBlockUncles.UnclesMessageVersion
+    parsed.merkleProof.valid(parsed.header.extensionRoot) shouldBe true
+    // relayed byte for byte (the synchronizer serializes the stored announcement)
+    InputBlockAnnouncement.serializer.toBytes(parsed).toSeq shouldBe bytes.toSeq
+    process(h, us, parsed, Seq.empty) shouldBe (Seq(parsed.id) -> Seq.empty)
+    h.bestInputBlocksChain() shouldBe Seq(parsed.id, b.id, a.id)
+    h.getInputBlock(parsed.id).map(ib => InputBlockAnnouncement.serializer.toBytes(ib).toSeq) shouldBe Some(bytes.toSeq)
+    h.getCreditedUncles(parsed.id) shouldBe Seq.empty
   }
 
 }

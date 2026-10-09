@@ -1307,6 +1307,70 @@ class ErgoNodeViewSynchronizerSpecification
   }
 
   property(
+    "NodeViewSynchronizer: NewInputBlockSibling announces the sibling's id only (input-block uncles)"
+  ) {
+    withFixture2 { ctx =>
+      import ctx._
+      import org.ergoplatform.consensus.Equal
+      import org.ergoplatform.modifiers.InputBlockTypeId
+      import org.ergoplatform.network.{PeerSpec, Version}
+      import scorex.core.network.{ConnectedPeer, SendToPeers}
+      import org.ergoplatform.network.peer.PeerInfo
+
+      val hist   = ErgoHistory.readOrGenerate(settings)(null)
+      val chain  = genChain(3, hist)
+      val header = chain.head.header
+
+      val wrappedState = boxesHolderGen
+        .map(WrappedUtxoState(_, createTempDir, parameters, settings))
+        .sample
+        .get
+
+      synchronizerMockRef ! ChangedState(wrappedState)
+      synchronizerMockRef ! ChangedHistory(hist)
+      synchronizerMockRef ! ChangedMempool(ErgoMemPool.empty(settings))
+      Thread.sleep(500)
+
+      val inputBlockInfo = InputBlockAnnouncement(
+        InputBlockAnnouncement.initialMessageVersion,
+        header,
+        InputBlockFields.empty,
+        Some(Seq(Array.fill(32)(1.toByte)))
+      )
+      hist.applyInputBlock(inputBlockInfo)
+
+      val subBlocksPeerSpec = PeerSpec(
+        settings.scorexSettings.network.agentName,
+        Version.SubblocksVersion,
+        settings.scorexSettings.network.nodeName,
+        None,
+        Seq(ModePeerFeature(StateType.Utxo, verifyingTransactions = true, None, -1))
+      )
+      val subBlocksPeer = ConnectedPeer(
+        connectionIdGen.sample.get,
+        pchProbe.ref,
+        Some(PeerInfo(subBlocksPeerSpec, System.currentTimeMillis()))
+      )
+      syncTracker.updateStatus(subBlocksPeer, Equal, Some(header.height))
+
+      // locally mined or received: in both cases only the id is announced, peers request the announcement
+      Seq(true, false).foreach { local =>
+        synchronizerMockRef ! NewInputBlockSibling(header.id, local)
+
+        val msg = ncProbe.expectMsgClass(3 seconds, classOf[SendToNetwork])
+        msg.message.spec.messageCode shouldBe InvSpec.messageCode
+        msg.sendingStrategy match {
+          case SendToPeers(peers) => peers should contain(subBlocksPeer)
+          case other              => fail(s"Expected SendToPeers, got $other")
+        }
+        val inv = msg.message.data.get.asInstanceOf[InvData]
+        inv.typeId shouldBe InputBlockTypeId.value
+        inv.ids shouldBe Seq(header.id)
+      }
+    }
+  }
+
+  property(
     "NodeViewSynchronizer: NewBestInputBlock(local=true) strips txs when exactly 4 transactions"
   ) {
     withFixture2 { ctx =>

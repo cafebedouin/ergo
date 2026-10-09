@@ -3,6 +3,7 @@ package org.ergoplatform.utils
 import com.google.common.io.Files.createTempDir
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, Input}
 import org.ergoplatform.mining.InputBlockFields
+import org.ergoplatform.modifiers.history.extension.{Extension, ExtensionCandidate}
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.history.ErgoHistory
@@ -20,7 +21,7 @@ import sigma.data.TrivialProp.TrueProp
 import sigma.interpreter.ProverResult
 
 /**
-  * Input blocks with uncles over a history with two ordering blocks applied and a UTXO state of `boxes`
+  * Input blocks with header-level uncle references over a history with two ordering blocks applied and a UTXO state of `boxes`
   * (boxes protected by `true`, spent with empty proofs).
   */
 trait InputBlockUnclesTestHelpers { self: Matchers =>
@@ -96,6 +97,37 @@ trait InputBlockUnclesTestHelpers { self: Matchers =>
                uncles: Seq[ModifierId] = Seq.empty,
                announcedUncles: Option[Seq[ModifierId]] = None): InputBlockAnnouncement =
     announceOn(freshInputBlockHeader(h, us), parent, txs, uncles, announcedUncles)
+
+  /**
+    * Version 2 announcement whose extension holds `fieldValue` under the uncles key (whatever its length) and
+    * whose trailing bytes are `announcementBytes`, for malformed fields.
+    */
+  def announceRaw(baseHeader: Header,
+                  parent: Option[ModifierId],
+                  txs: Seq[ErgoTransaction],
+                  fieldValue: Array[Byte],
+                  announcementBytes: Array[Byte]): InputBlockAnnouncement = {
+    val digest = Algos.merkleTreeRoot(txs.map(tx => LeafData @@ tx.serializedId))
+    val base = InputBlockFields.toExtensionFields(parent.map(idToBytes), digest, digest)
+    val ext = ExtensionCandidate(base.fields :+ (Extension.InputBlockUnclesKey -> fieldValue))
+    val fields = new InputBlockFields(parent.map(idToBytes), digest, digest, ext.proofForInputBlockData.get)
+    InputBlockAnnouncement(InputBlockUncles.UnclesMessageVersion, baseHeader.copy(extensionRoot = ext.digest), fields,
+      None, announcementBytes)
+  }
+
+  /**
+    * The announcement of the same block with its uncles stripped by a relay: version 1, and a proof of the three
+    * other input-block leaves only (still valid against the header's extension root).
+    */
+  def stripped(ib: InputBlockAnnouncement, parent: Option[ModifierId], txs: Seq[ErgoTransaction],
+               uncles: Seq[ModifierId]): InputBlockAnnouncement = {
+    val digest = Algos.merkleTreeRoot(txs.map(tx => LeafData @@ tx.serializedId))
+    val ext = InputBlockFields.toExtensionFields(parent.map(idToBytes), digest, digest, Some(uncles.map(idToBytes)))
+    ext.digest.sameElements(ib.header.extensionRoot) shouldBe true
+    val proof = ext.batchProofFor(Extension.InputBlockKeys: _*).get
+    val fields = new InputBlockFields(parent.map(idToBytes), digest, digest, proof)
+    InputBlockAnnouncement(InputBlockAnnouncement.initialMessageVersion, ib.header, fields, None)
+  }
 
   /** Version 1 announcement (as made before uncles support), no uncles field. */
   def announceV1(h: ErgoHistory,

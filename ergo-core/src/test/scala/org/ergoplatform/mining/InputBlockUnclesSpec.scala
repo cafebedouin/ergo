@@ -10,7 +10,8 @@ import scorex.crypto.hash.Digest32
 import scorex.util.{ModifierId, bytesToId, idToBytes}
 
 /**
-  * Encodings of input-block uncle references: extension field 0x03 0x03 and the version 2 announcement.
+  * Encodings of input-block uncle references: extension field 0x03 0x03, the version 2 announcement and its
+  * binding to the extension proof, and the field rule.
   */
 class InputBlockUnclesSpec extends ErgoCorePropertyTest {
 
@@ -96,6 +97,20 @@ class InputBlockUnclesSpec extends ErgoCorePropertyTest {
       withUncles.proofForInputBlockData.get.indices.length shouldBe legacy.indices.length + 1
       InputBlockUncles.fromExtensionFields(withUncles.fields) shouldBe Some(Seq.empty)
     }
+  }
+
+  property("field rule: at most two ids, no duplicate, no self-reference") {
+    val self = bytesToId(Array.fill(32)(7.toByte))
+    val u1 = bytesToId(Array.fill(32)(1.toByte))
+    val u2 = bytesToId(Array.fill(32)(2.toByte))
+    val u3 = bytesToId(Array.fill(32)(3.toByte))
+    InputBlockUncles.fieldViolation(self, Seq.empty) shouldBe None
+    InputBlockUncles.fieldViolation(self, Seq(u1)) shouldBe None
+    InputBlockUncles.fieldViolation(self, Seq(u1, u2)) shouldBe None
+    InputBlockUncles.fieldViolation(self, Seq(u1, u2, u3)).isDefined shouldBe true
+    InputBlockUncles.fieldViolation(self, Seq(u1, u1)).isDefined shouldBe true
+    InputBlockUncles.fieldViolation(self, Seq(self)).isDefined shouldBe true
+    InputBlockUncles.fieldViolation(self, Seq(u2, self)).isDefined shouldBe true
   }
 
 }

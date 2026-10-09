@@ -143,4 +143,24 @@ class BlocksApiRouteSpec
     }
   }
 
+  it should "report credited uncles of input blocks only with input-block uncles enabled" in {
+    val unclesSettings = settings.copy(nodeSettings = settings.nodeSettings.copy(inputBlockUncles = true))
+    val unclesRoute = BlocksApiRoute(nodeViewRef, digestReadersRef, unclesSettings).route
+    Get(prefix + "/bestInputBlock") ~> unclesRoute ~> check {
+      status shouldBe StatusCodes.OK
+      responseAs[Json].hcursor.downField("creditedUncles").as[Seq[String]] shouldBe Right(Seq.empty)
+    }
+    Get(prefix + "/bestInputChain") ~> unclesRoute ~> check {
+      status shouldBe StatusCodes.OK
+      responseAs[Json].hcursor.downField("creditedUncles").focus.isDefined shouldBe true
+    }
+    // flag off: the base response
+    Get(prefix + "/bestInputBlock") ~> route ~> check {
+      responseAs[Json].hcursor.downField("creditedUncles").focus shouldBe None
+    }
+    Get(prefix + "/bestInputChain") ~> route ~> check {
+      responseAs[Json].hcursor.downField("creditedUncles").focus shouldBe None
+    }
+  }
+
 }
