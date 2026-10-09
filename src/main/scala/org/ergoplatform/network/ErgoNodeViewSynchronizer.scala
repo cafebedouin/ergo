@@ -1324,10 +1324,43 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   // Input-block uncles enabled only, each bounded to the latest MaxTrackedInputBlocks entries:
   // - how many times the body (transaction ids) of an input block was requested, see requestInputBlockBodyBounded
   private val inputBlockBodyRequests = mutable.LinkedHashMap[ModifierId, Int]()
-  // - the peer that announced a sibling processed as an announcement only (its body is fetched from it on demand)
-  private val siblingAnnouncers = mutable.LinkedHashMap[ModifierId, ConnectedPeer]()
-  // - peers which asked for the body of such a sibling before it was fetched, answered on InputBlockBodyStored
-  private val pendingBodyRequesters = mutable.LinkedHashMap[ModifierId, Set[ConnectedPeer]]()
+  // - the peers that announced a sibling processed as an announcement only, first one first (its body is fetched
+  //   from them on demand, in turn), at most MaxSiblingAnnouncers each
+  private val siblingAnnouncers = mutable.LinkedHashMap[ModifierId, Vector[ConnectedPeer]]()
+  // - requests for the body of such a sibling received before it was fetched, answered on InputBlockBodyStored
+  private val pendingBodyRequests = mutable.LinkedHashMap[ModifierId, Vector[ErgoNodeViewSynchronizer.PendingBodyRequest]]()
+
+  /** Remembers `remote` as a peer that announced the sibling `id` (uncles enabled, body not fetched) */
+  private def addSiblingAnnouncer(id: ModifierId, remote: ConnectedPeer): Unit = {
+    val known = siblingAnnouncers.getOrElse(id, Vector.empty)
+    if (!known.contains(remote) && known.size < ErgoNodeViewSynchronizer.MaxSiblingAnnouncers) {
+      putBounded(siblingAnnouncers, id, known :+ remote)
+    }
+  }
+
+  /**
+    * Uncles enabled: a peer asked for (part of) the body of an input block whose announcement is stored but whose
+    * body is not (a sibling processed as an announcement only). The request is kept and answered once the body is
+    * stored (InputBlockBodyStored), and the body is fetched now from the peers that announced the block, in turn,
+    * within the budget of requestInputBlockBodyBounded (shared with every other request for that body). The base
+    * asks once and waits, with no timeout, so a late answer is still used.
+    */
+  private def awaitBodyOnDemand(ib: InputBlockAnnouncement,
+                                request: ErgoNodeViewSynchronizer.PendingBodyRequest): Unit = {
+    val pending = pendingBodyRequests.getOrElse(ib.id, Vector.empty)
+    if (!pending.contains(request)) {
+      putBounded(pendingBodyRequests, ib.id, pending :+ request)
+    }
+    val announcers = siblingAnnouncers.getOrElse(ib.id, Vector.empty)
+    if (announcers.isEmpty) {
+      log.warn(s"Requested by ${request.peer} body of ${ib.id}, which is not stored and whose announcer is not known")
+    } else {
+      val announcer = announcers(inputBlockBodyRequests.getOrElse(ib.id, 0) % announcers.size)
+      if (requestInputBlockBodyBounded(ib, announcer)) {
+        log.info(s"Fetching transactions of ${ib.id} from $announcer to answer ${request.peer}")
+      }
+    }
+  }
 
   private def putBounded[V](map: mutable.LinkedHashMap[ModifierId, V], id: ModifierId, value: V): Unit = {
     map.remove(id)
@@ -1563,6 +1596,11 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       // a copy requested before this one was stored (e.g. asked for after a relayed id while a push was in
       // flight) was still delivered: mark it received so the supplier is not treated as non-delivering
       setReceivedIfRequested(subBlockId, InputBlockTypeId.value, remote)
+      // uncles enabled: another peer announcing a sibling whose body was not fetched is another source for it
+      if (settings.nodeSettings.inputBlockUncles && siblingAnnouncers.contains(subBlockId) &&
+        hr.getInputBlockTransactionIds(subBlockId).isEmpty) {
+        addSiblingAnnouncer(subBlockId, remote)
+      }
       return
     }
 
@@ -1623,7 +1661,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
         if (!bodyWanted) {
           log.info(s"Sibling input block $subBlockId: announcement only, transactions not fetched")
-          putBounded(siblingAnnouncers, subBlockId, remote)
+          addSiblingAnnouncer(subBlockId, remote)
           viewHolderRef ! ProcessInputBlock(inputBlockInfo, remote)
         } else weakTxIdsOpt match {
           case Some(wIds) =>
@@ -1732,17 +1770,9 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
         val msg = Message(InputBlockTransactionIdsMessageSpec, Right(data), None)
         networkControllerRef ! SendToNetwork(msg, SendToPeer(remote))
       case None if settings.nodeSettings.inputBlockUncles && hr.getInputBlock(subblockId).isDefined =>
-        // a sibling processed as an announcement only (its body was not fetched): fetched now from the peer that
-        // announced it, and `remote` is answered once it is stored (InputBlockBodyStored); the base asks once and
-        // waits, with no timeout, so a late answer is still used
-        putBounded(pendingBodyRequesters, subblockId, pendingBodyRequesters.getOrElse(subblockId, Set.empty) + remote)
-        (hr.getInputBlock(subblockId), siblingAnnouncers.get(subblockId)) match {
-          case (Some(ib), Some(announcer)) =>
-            if (requestInputBlockBodyBounded(ib, announcer)) {
-              log.info(s"Fetching transactions of $subblockId from $announcer to answer $remote")
-            }
-          case _ =>
-            log.warn(s"Requested by $remote weak ids of $subblockId, whose body is not stored and whose announcer is not known")
+        // a sibling processed as an announcement only: its body is fetched on demand, `remote` answered then
+        hr.getInputBlock(subblockId).foreach { ib =>
+          awaitBodyOnDemand(ib, ErgoNodeViewSynchronizer.PendingTransactionIds(remote))
         }
       case None =>
         log.warn(s"Requested by $remote weak ids not found for: $subblockId")
@@ -1827,6 +1857,12 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
         val std = InputBlockTransactionsData(subBlockId, transactions)
         val msg = Message(InputBlockTransactionsMessageSpec, Right(std), None)
         networkControllerRef ! SendToNetwork(msg, SendToPeer(remote))
+      case None if settings.nodeSettings.inputBlockUncles && hr.getInputBlock(subBlockId).isDefined =>
+        // a sibling processed as an announcement only: its body is fetched on demand, the requested transactions
+        // are sent then
+        hr.getInputBlock(subBlockId).foreach { ib =>
+          awaitBodyOnDemand(ib, ErgoNodeViewSynchronizer.PendingTransactions(remote, req))
+        }
       case None =>
         log.warn(s"Transactions not found for requested sub block $subBlockId")
     }
@@ -2478,8 +2514,13 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     // input-block uncles enabled: the body of an input block was stored, peers waiting for it are answered
     case InputBlockBodyStored(id) =>
-      pendingBodyRequesters.remove(id).foreach { peers =>
-        peers.foreach(peer => processInputBlockTransactionIdsRequest(id, historyReader, peer))
+      pendingBodyRequests.remove(id).foreach { requests =>
+        requests.foreach {
+          case ErgoNodeViewSynchronizer.PendingTransactionIds(peer) =>
+            processInputBlockTransactionIdsRequest(id, historyReader, peer)
+          case ErgoNodeViewSynchronizer.PendingTransactions(peer, req) =>
+            processInputBlockTransactionsRequest(req, historyReader, peer)
+        }
       }
 
     // input-block uncles enabled: a sibling's announcement is announced by id (locally mined or not), peers that
@@ -2670,6 +2711,20 @@ object ErgoNodeViewSynchronizer {
 
   /** Input-block uncles: bound on the input blocks tracked for body requests, announcers and waiting peers */
   val MaxTrackedInputBlocks: Int = 1024
+
+  /** Input-block uncles: at most this many peers remembered as sources of a body-less sibling */
+  val MaxSiblingAnnouncers: Int = 4
+
+  /** Input-block uncles: a peer's request for the body of a sibling whose body is fetched on demand */
+  sealed trait PendingBodyRequest {
+    def peer: ConnectedPeer
+  }
+
+  /** A request for the transaction ids (InputBlockTransactionIdsTypeId) */
+  case class PendingTransactionIds(peer: ConnectedPeer) extends PendingBodyRequest
+
+  /** A request for specific transactions (InputBlockTransactionsRequest) */
+  case class PendingTransactions(peer: ConnectedPeer, req: InputBlockTransactionsRequest) extends PendingBodyRequest
 
   val LocalInputBlockChunksTTL: FiniteDuration = 10.minutes
 
