@@ -1,7 +1,8 @@
 package org.ergoplatform.mining
 
 import org.ergoplatform.AutolykosSolution
-import org.ergoplatform.mining.CandidateGenerator.Candidate
+import org.ergoplatform.mining.CandidateGenerator.{Candidate, EarlierCandidateOnBestParent, MinedOnCurrentCandidate,
+  MinedOnEarlierCandidate, NoCandidateForInputSolution}
 import org.ergoplatform.modifiers.history.extension.Extension
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.nodeView.history.ErgoHistory
@@ -10,7 +11,7 @@ import org.ergoplatform.settings.{Algos, ErgoSettings, ErgoValidationSettingsUpd
 import org.ergoplatform.subblocks.{InputBlockAnnouncement, InputBlockUncles}
 import org.ergoplatform.utils.{ErgoCorePropertyTest, InputBlockUnclesTestHelpers}
 import scorex.crypto.authds.LeafData
-import scorex.util.bytesToId
+import scorex.util.{ModifierId, bytesToId}
 import sigma.crypto.CryptoConstants
 
 /**
@@ -140,6 +141,60 @@ class CandidateGeneratorUnclesSpec extends ErgoCorePropertyTest with InputBlockU
       Some(olderBlock.id)
     // only the current candidate considered: not found
     CandidateGenerator.inputSolutionCandidate(Seq(newer), solution, minedOnOlder) shouldBe None
+  }
+
+  /**
+    * A candidate on the current best input block was built before the miner's previous block applied its
+    * transactions, so it repeats them; a solution on it is refused, as without uncles support. A candidate on an
+    * earlier block gives a sibling and is accepted.
+    */
+  property("input solution on an earlier candidate is refused if its parent is the current best input block") {
+    val (h, us) = setup()
+    val (_, b, _) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    val older = candidate(h, us, unclesSettings)
+    older.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) shouldBe Some(b.id)
+    val current = older.copy(candidateBlock = older.candidateBlock.copy(timestamp = older.candidateBlock.timestamp + 1))
+    val (olderBlock, _) = CandidateGenerator.completeInputBlock(older.candidateBlock, solution)
+    val (currentBlock, _) = CandidateGenerator.completeInputBlock(current.candidateBlock, solution)
+    val minedOn = (id: ModifierId) => (header: Header, _: Parameters) => header.id == id
+    val best = h.bestInputBlock().map(_.id)
+    best shouldBe Some(b.id)
+
+    CandidateGenerator.judgeInputSolution(current, Seq(older), solution, minedOn(olderBlock.id), best) match {
+      case EarlierCandidateOnBestParent(sbi) => sbi.id shouldBe olderBlock.id
+      case other => fail(s"expected a refusal, got $other")
+    }
+    // the current candidate and no candidate, for completeness
+    CandidateGenerator.judgeInputSolution(current, Seq(older), solution, minedOn(currentBlock.id), best) match {
+      case MinedOnCurrentCandidate(sbi, _) => sbi.id shouldBe currentBlock.id
+      case other => fail(s"expected the current candidate, got $other")
+    }
+    CandidateGenerator.judgeInputSolution(current, Seq(older), solution, minedOn(bytesToId(Array.fill(32)(9.toByte))),
+      best) shouldBe NoCandidateForInputSolution
+  }
+
+  property("input solution on an earlier candidate is accepted if its parent is an earlier block") {
+    val (h, us) = setup()
+    val (_, b, _) = chainWithSibling(h, us, Seq(spend(boxes(2))))
+    val older = candidate(h, us, unclesSettings)
+    val (olderBlock, _) = CandidateGenerator.completeInputBlock(older.candidateBlock, solution)
+    // a new best input block C (child of B): the older candidate's parent B is now an earlier block
+    val c = announce(h, us, Some(b.id), Seq(spend(boxes(3))))
+    process(h, us, c, Seq(spend(boxes(3))))._1 shouldBe Seq(c.id)
+    val current = candidate(h, us, unclesSettings)
+    current.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) shouldBe Some(c.id)
+    val best = h.bestInputBlock().map(_.id)
+    best shouldBe Some(c.id)
+
+    val minedOnOlder = (header: Header, _: Parameters) => header.id == olderBlock.id
+    CandidateGenerator.judgeInputSolution(current, Seq(older), solution, minedOnOlder, best) match {
+      case MinedOnEarlierCandidate(sbi, _) =>
+        sbi.id shouldBe olderBlock.id
+        sbi.prevInputBlockId shouldBe Some(b.id)
+        // a sibling of C: relayed and referenceable
+        h.isSiblingAnnouncement(sbi) shouldBe true
+      case other => fail(s"expected an acceptance, got $other")
+    }
   }
 
   property("uncles disabled: no uncles field, version 1 announcement, same candidate cache key as the base") {

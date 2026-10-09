@@ -299,26 +299,32 @@ class CandidateGenerator(
             // With uncles enabled, the solution is judged against the candidate it was mined on: the current one
             // or an earlier one on the same parent. A block from an earlier candidate links an input block which
             // may no longer be the tip, so it becomes a sibling which later input blocks can reference as an uncle.
-            val candidates = if (ergoSettings.nodeSettings.inputBlockUncles) {
-              state.cachedCandidate.toList ++ state.previousCandidates
-            } else {
-              state.cachedCandidate.toList
-            }
+            val earlier = if (ergoSettings.nodeSettings.inputBlockUncles) state.previousCandidates else Nil
             val powScheme = ergoSettings.chainSettings.powScheme
-            inputSolutionCandidate(candidates, solution, powScheme.checkInputBlockPoW) match {
-              case Some((source, sbi, sbt)) if state.cachedCandidate.exists(_ eq source) => // check PoW only
+            val bestInputBlockId = state.hr.bestBlocks._2.map(_.id)
+            judgeInputSolution(state.cachedCandidate.get, earlier, solution, powScheme.checkInputBlockPoW,
+              bestInputBlockId) match {
+              case MinedOnCurrentCandidate(sbi, sbt) => // check PoW only
                 log.info(s"Input-block ${sbi.id} mined @ height ${sbi.header.height}!")
                 sendInputToNodeView(sbi, sbt)
                 context.become(initialized(state.copy(
                   cachedCandidate = None,
                   previousCandidates = withPrevious(state.cachedCandidate, state.previousCandidates))))
                 StatusReply.success(())
-              case Some((_, sbi, sbt)) =>
+              case MinedOnEarlierCandidate(sbi, sbt) =>
                 // mined on an earlier candidate: the current candidate stays
                 log.info(s"Input-block ${sbi.id} mined @ height ${sbi.header.height} on an earlier candidate")
                 sendInputToNodeView(sbi, sbt)
                 StatusReply.success(())
-              case None =>
+              case EarlierCandidateOnBestParent(sbi) =>
+                // built on the current best input block before the miner's previous block applied its
+                // transactions, so it repeats them: refused, as without uncles support
+                log.warn(s"Input-block solution ${sbi.id} fits an earlier candidate on the current best input block " +
+                  s"${bestInputBlockId.getOrElse("None")}, refused")
+                StatusReply.error(
+                  new Exception(s"Invalid input block! PoW valid: false")
+                )
+              case NoCandidateForInputSolution =>
                 // the solution was found on an earlier candidate; keep the current one, the miner gets it on its next poll
                 log.warn(s"Input-block solution does not fit the current candidate")
                 StatusReply.error(
@@ -1381,6 +1387,53 @@ object CandidateGenerator extends ScorexLogging {
         (c, sbi, sbt)
       }
       .find { case (c, sbi, _) => powValid(sbi.header, c.parameters) }
+  }
+
+  /** How an input-block solution is handled, see `judgeInputSolution` */
+  sealed trait InputSolutionVerdict
+
+  /** Mined on the current candidate: accepted, as without uncles support */
+  case class MinedOnCurrentCandidate(sbi: InputBlockAnnouncement, sbt: InputBlockTransactionsData)
+    extends InputSolutionVerdict
+
+  /** Mined on an earlier candidate whose parent is not the current best input block: accepted, a sibling */
+  case class MinedOnEarlierCandidate(sbi: InputBlockAnnouncement, sbt: InputBlockTransactionsData)
+    extends InputSolutionVerdict
+
+  /** Mined on an earlier candidate whose parent is the current best input block: refused */
+  case class EarlierCandidateOnBestParent(sbi: InputBlockAnnouncement) extends InputSolutionVerdict
+
+  /** Fits no candidate: refused */
+  case object NoCandidateForInputSolution extends InputSolutionVerdict
+
+  /**
+    * Judges an input-block solution against the current candidate and the earlier ones (newest first; empty with
+    * uncles disabled, which gives the handling without uncles support).
+    *
+    * A solution found on an earlier candidate is accepted only if that candidate's parent is not the current best
+    * input block. A candidate on the current best input block was built before the miner's previous block applied
+    * its transactions, so it repeats them: the node would reject it as a double spend, and as it would never become
+    * best it would never be relayed either. Such a solution is refused, as without uncles support. A candidate on
+    * an earlier block gives a sibling, which later input blocks can reference as an uncle.
+    *
+    * @param bestInputBlockId - the current best input block (None if none: then a candidate without a parent is the
+    *                           one on the current best)
+    */
+  def judgeInputSolution(current: Candidate,
+                         earlier: Seq[Candidate],
+                         solution: AutolykosSolution,
+                         powValid: (Header, Parameters) => Boolean,
+                         bestInputBlockId: Option[ModifierId]): InputSolutionVerdict = {
+    inputSolutionCandidate(current +: earlier, solution, powValid) match {
+      case Some((c, sbi, sbt)) if c eq current => MinedOnCurrentCandidate(sbi, sbt)
+      case Some((c, sbi, sbt)) =>
+        if (c.candidateBlock.inputBlockFields.prevInputBlockId.map(bytesToId) == bestInputBlockId) {
+          EarlierCandidateOnBestParent(sbi)
+        } else {
+          MinedOnEarlierCandidate(sbi, sbt)
+        }
+      case None => NoCandidateForInputSolution
+    }
   }
 
   /** Checks that transaction "tx" is not spending outputs spent already by transactions "txs" */

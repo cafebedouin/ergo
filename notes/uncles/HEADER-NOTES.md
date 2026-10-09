@@ -12,7 +12,7 @@ credited or not. Everything is behind the existing node setting `ergo.node.input
 
 **Round 1 (7ad049247), verified by the maintainer on GitHub:** compiles as written, all new specs green over 2
 repeats, existing specs match the baseline, and a mutation crediting nothing turns all 9 credit-asserting
-properties red. **Round 2 (see the end of this file) was not compiled or run here either.**
+properties red. **Rounds 2 and 3 (see the end of this file) were not compiled or run here either.**
 
 **Round 1 was written without compiling or running anything here.** The session had no sbt, and Maven Central was blocked
 by the network proxy (HTTP 403). The code was written by reading the surrounding types.
@@ -147,6 +147,8 @@ For comparison, the starting branch (8a5b9f25c) was 20 files, +2044 / −108 aga
    - Input solutions (flag on) are judged against the current candidate, then the previous ones on the same
      parent. A block mined on an earlier candidate is sent to the node view, where it is a sibling, is relayed,
      and can be referenced. With the flag off only the current candidate is tried, as on the base.
+   - Since round 3, a solution on an earlier candidate is accepted only if that candidate's parent is **not** the
+     current best input block; otherwise it is refused as on the base (`judgeInputSolution`, see Round 3).
 7. **Sibling announcement relay.**
    - The trigger, `isSiblingAnnouncement`, is computed before the announcement is stored: the announcement is
      not known yet, it belongs to the best ordering block, and its parent (or the ordering block, for a first
@@ -256,6 +258,7 @@ For comparison, the starting branch (8a5b9f25c) was 20 files, +2044 / −108 aga
 | --- | --- |
 | field round-trip, binding to the extension proof | `InputBlockUnclesSpec`: round trip, malformed, "version 2 announcement repeats committed uncles…", "announced uncles other than the committed ones are not committed", "proof is unchanged…" |
 | generator references a seen PoW-valid sibling, block validates | `CandidateGeneratorUnclesSpec`: "generator references a seen PoW-valid sibling…" |
+| solution on an earlier candidate: refused on the best parent, accepted on an earlier block (round 3) | `CandidateGeneratorUnclesSpec`: "input solution on an earlier candidate is refused if its parent is the current best input block", "… is accepted if its parent is an earlier block" |
 | K = 2, by arrival, not already credited | `CandidateGeneratorUnclesSpec`: "generator takes at most two siblings, by arrival…"; `InputBlockUnclesSpecification`: "uncle candidates…" |
 | three ids / malformed length / self-reference / duplicate | `InputBlockUnclesSpecification`: "three ids…", "malformed length…", "self-reference…", "duplicate id…" (+ ergo-core "field rule") |
 | uncle from another ordering block / parent not on chain / already credited / unknown | `InputBlockUnclesSpecification`: "uncle from another ordering block…", "uncle whose parent is not on the chain, or which is on the chain…", "uncle already credited to an ancestor…", "unknown id…; credited once the sibling's announcement arrives" |
@@ -335,3 +338,39 @@ sbt "testOnly org.ergoplatform.http.routes.BlocksApiRouteSpec org.ergoplatform.n
 
 No spec forces `refreshUncleCredits` to throw: it is private and has no failure injection point, and adding one
 only for a test would change production code beyond the request.
+
+## Round 3
+
+One change in `CandidateGenerator`'s handling of an input-block solution, no design change.
+
+- **Change.** A solution found on an earlier candidate is accepted only if that candidate's parent is not the
+  current best input block (`state.hr.bestBlocks._2`). Otherwise it is refused as on the base: the reply is the
+  base's error, "Invalid input block! PoW valid: false", and the current candidate stays.
+- **Reason** (measured by the maintainer on GitHub runs):
+  - Such a candidate was built before the miner's previous block applied its transactions, so it repeats them.
+  - The miner's own node rejects it as "Double spending" (28 to 65 per run under load).
+  - The unchanged base keeps it as the tip and the miner stalls on it. Since it is never best, it is never
+    relayed.
+  - Every failure seen extended the tip (307 of 307), so the change loses no creditable sibling. It refuses
+    about 0.3 to 1.4 % of replies.
+- **Code.** The decision is the pure function `CandidateGenerator.judgeInputSolution(current, earlier, solution,
+  powValid, bestInputBlockId)`, which the actor calls. It returns one of four verdicts:
+  - `MinedOnCurrentCandidate`
+  - `MinedOnEarlierCandidate`
+  - `EarlierCandidateOnBestParent` (refused)
+  - `NoCandidateForInputSolution`
+
+  With the flag off, `earlier` is empty, so only the first and last verdicts occur, exactly as on the base.
+- **Choice.** With no best input block, a candidate without a parent counts as "on the current best": both
+  `None`. That candidate builds on the same thing a fresh candidate would, so it is refused too.
+- **Specs** (`CandidateGeneratorUnclesSpec`):
+  - "input solution on an earlier candidate is refused if its parent is the current best input block". Also
+    checks the current-candidate and no-candidate verdicts.
+  - "input solution on an earlier candidate is accepted if its parent is an earlier block". Also checks that the
+    accepted block is a sibling announcement.
+
+Spec to run for round 3:
+
+```
+sbt "testOnly org.ergoplatform.mining.CandidateGeneratorUnclesSpec org.ergoplatform.mining.CandidateGeneratorSpec org.ergoplatform.mining.ErgoMinerSpec org.ergoplatform.mining.ErgoMiningThreadSpec"
+```
