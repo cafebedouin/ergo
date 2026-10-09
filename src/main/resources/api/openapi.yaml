@@ -3125,6 +3125,12 @@ paths:
                     type: string
                     description: ID of the best input block
                     example: '9c8fe20a4acd23e3f1bf38671ce97103ad96d8f1c780b5e5e865e4873ae16456'
+                  creditedUncles:
+                    type: array
+                    description: Only with the node setting inputBlockUncles. Uncles referenced by the best input block which passed the uncle rule
+                    items:
+                      type: string
+                      description: ID of a credited uncle input block
         default:
           description: Error
           content:
@@ -3158,6 +3164,13 @@ paths:
                       type: string
                       description: ID of an input block in the chain
                       example: '9c8fe20a4acd23e3f1bf38671ce97103ad96d8f1c780b5e5e865e4873ae16456'
+                  creditedUncles:
+                    type: object
+                    description: Only with the node setting inputBlockUncles. For each input block of the chain (by ID), the uncles it references which passed the uncle rule
+                    additionalProperties:
+                      type: array
+                      items:
+                        type: string
         default:
           description: Error
           content:

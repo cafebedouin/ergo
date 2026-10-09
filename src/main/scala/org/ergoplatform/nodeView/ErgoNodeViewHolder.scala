@@ -346,8 +346,15 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
 
     // process input block got from p2p network (with no transactions)
     case ProcessInputBlock(inputBlockInfo, remote) =>
+      // with input-block uncles enabled, a sibling's announcement is relayed (decided before it is stored)
+      val sibling = history().isSiblingAnnouncement(inputBlockInfo)
+
       // apply input block with no transaction, and check if downloading parent input block is needed
       val toDownloadOpt = history().applyInputBlock(inputBlockInfo)
+
+      if (sibling && history().getInputBlock(inputBlockInfo.id).isDefined) {
+        context.system.eventStream.publish(NewInputBlockSibling(inputBlockInfo.id, local = false))
+      }
 
       // ask for parent input block
       // we do it before asking for transactions of this input-block to get parent and its transactions ASAP
@@ -902,7 +909,12 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
 
     case LocallyGeneratedInputBlock(subblockInfo, subBlockTransactionsData) =>
       log.info(s"Got locally generated input block ${subblockInfo.header.id}")
+      // with input-block uncles enabled, e.g. a block mined on an earlier candidate
+      val sibling = history().isSiblingAnnouncement(subblockInfo)
       val toDownloadOpt = history().applyInputBlock(subblockInfo)
+      if (sibling && history().getInputBlock(subblockInfo.id).isDefined) {
+        context.system.eventStream.publish(NewInputBlockSibling(subblockInfo.id, local = true))
+      }
 
       // this handling done just in case, shouldn't happen
       toDownloadOpt.foreach { _ =>

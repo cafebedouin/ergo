@@ -202,29 +202,45 @@ case class BlocksApiRoute(viewHolderRef: ActorRef, readersHolder: ActorRef, ergo
     * Input/Ordering blocks related API methods
     */
 
+  // with input-block uncles enabled, responses reporting input blocks carry one extra field, "creditedUncles"
+  private val inputBlockUncles = ergoSettings.nodeSettings.inputBlockUncles
+
   /**
-    * @return ids of best ordering and input blocks
+    * @return ids of best ordering and input blocks (with input-block uncles enabled, also the uncles credited to
+    *         the best input block)
     */
   private def getBestInputBlockR = {
     (pathPrefix("bestInputBlock") & get) {
       ApiResponse(getHistory.map{ h =>
         val bh = h.bestHeaderOpt.map(_.id)
         val bi = h.bestInputBlock().map(_.id)
-        Json.obj("bestOrdering" -> bh.getOrElse("").asJson, "bestInputBlock" -> bi.getOrElse("").asJson)
+        val base = Json.obj("bestOrdering" -> bh.getOrElse("").asJson, "bestInputBlock" -> bi.getOrElse("").asJson)
+        if (inputBlockUncles) {
+          base.deepMerge(Json.obj("creditedUncles" -> bi.map(h.getCreditedUncles).getOrElse(Seq.empty).asJson))
+        } else {
+          base
+        }
       })
     }
   }
 
 
   /**
-    * @return ids of best input-blocks chain, along with ordering block id
+    * @return ids of best input-blocks chain, along with ordering block id (with input-block uncles enabled, also
+    *         the uncles credited to each input block of the chain, by input block id)
     */
   private def getBestInputBlocksChainR = {
     (pathPrefix("bestInputChain") & get) {
       ApiResponse(getHistory.map{ h =>
         val bh = h.bestHeaderOpt.map(_.id)
         val bi = h.bestInputBlocksChain()
-        Json.obj("bestOrdering" -> bh.getOrElse("").asJson, "bestInputBlocks" -> bi.asJson)
+        val base = Json.obj("bestOrdering" -> bh.getOrElse("").asJson, "bestInputBlocks" -> bi.asJson)
+        if (inputBlockUncles) {
+          val credited = Json.obj(bi.map(id => id.toString -> h.getCreditedUncles(id).asJson): _*)
+          base.deepMerge(Json.obj("creditedUncles" -> credited))
+        } else {
+          base
+        }
       })
     }
   }

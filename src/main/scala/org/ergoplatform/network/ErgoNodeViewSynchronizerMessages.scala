@@ -60,6 +60,15 @@ object ErgoNodeViewSynchronizerMessages {
     case class NewBestInputBlock(idOpt: Option[ModifierId], local: Boolean) extends NodeViewChange
 
     /**
+      * Input-block uncles enabled only: the announcement of a sibling input block (its parent already has a known
+      * child) was stored. It is announced to peers by id, so that miners can reference it as an uncle. Only the
+      * announcement: nothing is added about its transactions.
+      *
+      * @param local - if true, the input block is generated locally
+      */
+    case class NewInputBlockSibling(id: ModifierId, local: Boolean)
+
+    /**
      * Event which is published when rollback happened (on finding a better chain)
      *
      * @param branchPoint - block id which is last in the chain after rollback (before applying blocks from a fork)

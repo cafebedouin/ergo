@@ -289,6 +289,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     context.system.eventStream.subscribe(self, classOf[DownloadInputBlock])
     context.system.eventStream.subscribe(self, classOf[DownloadInputBlockTransactions])
     context.system.eventStream.subscribe(self, classOf[NewBestInputBlock])
+    context.system.eventStream.subscribe(self, classOf[NewInputBlockSibling])
     context.system.eventStream.subscribe(self, classOf[LocallyGeneratedOrderingBlock])
 
     // subscribe for immediate block mining announcements (fast propagation)
@@ -2409,6 +2410,16 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     // this signal is sent on ordering block application, nothing p2p layer should do
     case NewBestInputBlock(None, _) =>
+
+    // input-block uncles enabled: a sibling's announcement is announced by id (locally mined or not), peers that
+    // lack it request it (processInv -> modifiersReq -> processInputBlockRequest)
+    case NewInputBlockSibling(id, local) =>
+      val peers = inputBlockRecipients(historyReader)
+      if (peers.nonEmpty) {
+        log.debug(s"Announcing sibling input block $id (local: $local)")
+        val msg = Message(InvSpec, Right(InvData(InputBlockTypeId.value, Seq(id))), None)
+        networkControllerRef ! SendToNetwork(msg, SendToPeers(peers))
+      }
   }
 
   /** handlers of messages coming from peers */
