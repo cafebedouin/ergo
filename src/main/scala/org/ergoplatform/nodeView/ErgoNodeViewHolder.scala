@@ -426,6 +426,11 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         log.debug(s"New input-block with transactions found: $id")
         context.system.eventStream.publish(NewBestInputBlock(Some(id), local))
       }
+
+      // with input-block uncles enabled, peers which asked for this body before it was stored are answered now
+      if (settings.nodeSettings.inputBlockUncles && history().getInputBlockTransactionIds(inputBlockId).isDefined) {
+        context.system.eventStream.publish(InputBlockBodyStored(inputBlockId))
+      }
     } catch {
       case t: Throwable => log.error(s"Exception during input block $inputBlockId processing ", t)
     }
@@ -909,12 +914,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
 
     case LocallyGeneratedInputBlock(subblockInfo, subBlockTransactionsData) =>
       log.info(s"Got locally generated input block ${subblockInfo.header.id}")
-      // with input-block uncles enabled, e.g. a block mined on an earlier candidate
-      val sibling = history().isSiblingAnnouncement(subblockInfo)
       val toDownloadOpt = history().applyInputBlock(subblockInfo)
-      if (sibling && history().getInputBlock(subblockInfo.id).isDefined) {
-        context.system.eventStream.publish(NewInputBlockSibling(subblockInfo.id, local = true))
-      }
 
       // this handling done just in case, shouldn't happen
       toDownloadOpt.foreach { _ =>
@@ -924,12 +924,21 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
       val inputBlockTxs = subBlockTransactionsData.transactions
       processInputBlockTransactions(subblockInfo.id, inputBlockTxs, local = true)
 
-      // with input-block uncles enabled, an own block which did not become the best one (it lost its parent
-      // position, or its body failed) is announced as a sibling, so that peers have it and can credit it too
-      // (a best one was announced by NewBestInputBlock, a sibling at arrival above)
-      if (settings.nodeSettings.inputBlockUncles && !sibling && history().getInputBlock(subblockInfo.id).isDefined &&
+      // With input-block uncles enabled, an own block which did not become the best one (e.g. mined on an earlier
+      // candidate, or it lost its parent position) is announced as a sibling, so that peers have it and can credit
+      // it too; a best one was announced by NewBestInputBlock. It is announced only if its transactions apply on its
+      // own prefix: peers would fetch a block whose body fails and fail it too.
+      if (settings.nodeSettings.inputBlockUncles && history().getInputBlock(subblockInfo.id).isDefined &&
         !history().bestInputBlocksChain().contains(subblockInfo.id)) {
-        context.system.eventStream.publish(NewInputBlockSibling(subblockInfo.id, local = true))
+        val prefix = history().chainTransactionsThrough(subblockInfo.prevInputBlockId)
+        val applies = Try(minimalState().applyInputBlock(inputBlockTxs, prefix, subblockInfo.header)).flatten
+        applies match {
+          case Success(_) =>
+            context.system.eventStream.publish(NewInputBlockSibling(subblockInfo.id, local = true))
+          case Failure(e) =>
+            log.warn(s"Own input block ${subblockInfo.id} is not announced: its transactions do not apply on its " +
+              s"prefix (${e.getMessage})")
+        }
       }
   }
 

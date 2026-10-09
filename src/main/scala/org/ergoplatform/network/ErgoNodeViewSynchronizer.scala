@@ -290,6 +290,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     context.system.eventStream.subscribe(self, classOf[DownloadInputBlockTransactions])
     context.system.eventStream.subscribe(self, classOf[NewBestInputBlock])
     context.system.eventStream.subscribe(self, classOf[NewInputBlockSibling])
+    context.system.eventStream.subscribe(self, classOf[InputBlockBodyStored])
     context.system.eventStream.subscribe(self, classOf[LocallyGeneratedOrderingBlock])
 
     // subscribe for immediate block mining announcements (fast propagation)
@@ -1320,6 +1321,40 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
    */
   private val localInputBlockChunks = mutable.Map[ModifierId, ErgoNodeViewSynchronizer.InputBlockDiffData]()
 
+  // Input-block uncles enabled only, each bounded to the latest MaxTrackedInputBlocks entries:
+  // - how many times the body (transaction ids) of an input block was requested, see requestInputBlockBodyBounded
+  private val inputBlockBodyRequests = mutable.LinkedHashMap[ModifierId, Int]()
+  // - the peer that announced a sibling processed as an announcement only (its body is fetched from it on demand)
+  private val siblingAnnouncers = mutable.LinkedHashMap[ModifierId, ConnectedPeer]()
+  // - peers which asked for the body of such a sibling before it was fetched, answered on InputBlockBodyStored
+  private val pendingBodyRequesters = mutable.LinkedHashMap[ModifierId, Set[ConnectedPeer]]()
+
+  private def putBounded[V](map: mutable.LinkedHashMap[ModifierId, V], id: ModifierId, value: V): Unit = {
+    map.remove(id)
+    map.put(id, value)
+    while (map.size > ErgoNodeViewSynchronizer.MaxTrackedInputBlocks) {
+      map.remove(map.head._1)
+    }
+  }
+
+  /**
+    * Requests the body (transaction ids) of an input block from `remote`, at most MaxInputBlockBodyRequests times
+    * per input block (uncles enabled: a sibling's body fetched late, or again after a lost request).
+    *
+    * @return whether the request was sent
+    */
+  private def requestInputBlockBodyBounded(ib: InputBlockAnnouncement, remote: ConnectedPeer): Boolean = {
+    val sent = inputBlockBodyRequests.getOrElse(ib.id, 0)
+    if (sent < ErgoNodeViewSynchronizer.MaxInputBlockBodyRequests) {
+      putBounded(inputBlockBodyRequests, ib.id, sent + 1)
+      requestInputBlockTransactionIds(ib, remote)
+      true
+    } else {
+      log.debug(s"Not requesting the body of input block ${ib.id} again: $sent requests sent")
+      false
+    }
+  }
+
   /**
    * Cleanup old entries from localInputBlockChunks cache.
    *
@@ -1577,14 +1612,18 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
         // once needed (a block building on it arrives); always fetched with uncles disabled
         val bodyWanted = hr.inputBlockBodyWanted(inputBlockInfo)
         if (bodyWanted) {
+          // all body-less ancestors, also behind ancestors with their body (a lost request), asked from the peer
+          // which sent this block (it built on them), a bounded number of times
           hr.bodilessAncestors(inputBlockInfo).foreach { ancestor =>
-            log.info(s"Fetching transactions of ${ancestor.id}, an ancestor of input block $subBlockId, from $remote")
-            requestInputBlockTransactionIds(ancestor, remote)
+            if (requestInputBlockBodyBounded(ancestor, remote)) {
+              log.info(s"Fetching transactions of ${ancestor.id}, an ancestor of input block $subBlockId, from $remote")
+            }
           }
         }
 
         if (!bodyWanted) {
           log.info(s"Sibling input block $subBlockId: announcement only, transactions not fetched")
+          putBounded(siblingAnnouncers, subBlockId, remote)
           viewHolderRef ! ProcessInputBlock(inputBlockInfo, remote)
         } else weakTxIdsOpt match {
           case Some(wIds) =>
@@ -1692,6 +1731,19 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
         val data = InputBlockTransactionIdsData(subblockId, ids)
         val msg = Message(InputBlockTransactionIdsMessageSpec, Right(data), None)
         networkControllerRef ! SendToNetwork(msg, SendToPeer(remote))
+      case None if settings.nodeSettings.inputBlockUncles && hr.getInputBlock(subblockId).isDefined =>
+        // a sibling processed as an announcement only (its body was not fetched): fetched now from the peer that
+        // announced it, and `remote` is answered once it is stored (InputBlockBodyStored); the base asks once and
+        // waits, with no timeout, so a late answer is still used
+        putBounded(pendingBodyRequesters, subblockId, pendingBodyRequesters.getOrElse(subblockId, Set.empty) + remote)
+        (hr.getInputBlock(subblockId), siblingAnnouncers.get(subblockId)) match {
+          case (Some(ib), Some(announcer)) =>
+            if (requestInputBlockBodyBounded(ib, announcer)) {
+              log.info(s"Fetching transactions of $subblockId from $announcer to answer $remote")
+            }
+          case _ =>
+            log.warn(s"Requested by $remote weak ids of $subblockId, whose body is not stored and whose announcer is not known")
+        }
       case None =>
         log.warn(s"Requested by $remote weak ids not found for: $subblockId")
     }
@@ -2424,6 +2476,12 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     // this signal is sent on ordering block application, nothing p2p layer should do
     case NewBestInputBlock(None, _) =>
 
+    // input-block uncles enabled: the body of an input block was stored, peers waiting for it are answered
+    case InputBlockBodyStored(id) =>
+      pendingBodyRequesters.remove(id).foreach { peers =>
+        peers.foreach(peer => processInputBlockTransactionIdsRequest(id, historyReader, peer))
+      }
+
     // input-block uncles enabled: a sibling's announcement is announced by id (locally mined or not), peers that
     // lack it request it (processInv -> modifiersReq -> processInputBlockRequest)
     case NewInputBlockSibling(id, local) =>
@@ -2607,6 +2665,12 @@ object ErgoNodeViewSynchronizer {
    * TTL for local input block chunks cache.
    * Entries older than this will be cleaned up to prevent memory exhaustion.
    */
+  /** Input-block uncles: at most this many requests for the body of one input block (a lost one is retried) */
+  val MaxInputBlockBodyRequests: Int = 3
+
+  /** Input-block uncles: bound on the input blocks tracked for body requests, announcers and waiting peers */
+  val MaxTrackedInputBlocks: Int = 1024
+
   val LocalInputBlockChunksTTL: FiniteDuration = 10.minutes
 
   /**

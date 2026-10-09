@@ -69,6 +69,12 @@ object ErgoNodeViewSynchronizerMessages {
     case class NewInputBlockSibling(id: ModifierId, local: Boolean)
 
     /**
+      * Input-block uncles enabled only: the transactions (body) of an input block were stored. Peers which asked for
+      * them while they were not fetched (a sibling processed as an announcement only) are answered then.
+      */
+    case class InputBlockBodyStored(id: ModifierId)
+
+    /**
      * Event which is published when rollback happened (on finding a better chain)
      *
      * @param branchPoint - block id which is last in the chain after rollback (before applying blocks from a fork)
