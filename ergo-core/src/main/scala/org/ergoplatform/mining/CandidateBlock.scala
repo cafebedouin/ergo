@@ -20,7 +20,7 @@ import scorex.crypto.hash.Digest32
 * @param inputBlockFieldsProof - batch Merkle proof for `prevSubBlockId`` and `subblockTransactionsDigest`
 *                      (as they are coming from extension section, and committed in `subBlock` header via extension
 *                      digest)
-* @param uncleIds - uncles merged by the input block (extension key 0x03 0x03), None if the field is absent
+* @param uncleIds - uncles referenced by the input block (extension key 0x03 0x03), None if the field is absent
 */
 class InputBlockFields(val prevInputBlockId: Option[Array[Byte]],
                        val transactionsDigest: Digest32,
@@ -51,7 +51,7 @@ object InputBlockFields {
     // digest (Merkle tree root) first class transactions since ordering block till last input-block
     val prevTxs = (PreviousInputBlockTransactionsDigestKey, prevTransactionsDigest)
 
-    // uncles merged by the input block, written (possibly empty) only when uncles are enabled
+    // uncles referenced by the input block, written only when uncles are enabled and there are some
     val uncles = uncleIdsOpt.map(ids => (InputBlockUnclesKey, InputBlockUncles.fieldValue(ids))).toSeq
 
     ExtensionCandidate(prevInput ++ Seq(txs, prevTxs) ++ uncles)

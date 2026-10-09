@@ -7,13 +7,14 @@ import org.ergoplatform.network.message.inputblocks.OrderingBlockAnnouncement
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
 import org.ergoplatform.nodeView.state.ErgoState
 import org.ergoplatform.settings.Algos
-import org.ergoplatform.subblocks.InputBlockAnnouncement
+import org.ergoplatform.subblocks.{InputBlockAnnouncement, InputBlockUncles}
 import scorex.crypto.authds.LeafData
 import scorex.crypto.hash.Digest32
 import scorex.util.{ModifierId, ScorexLogging}
 import spire.syntax.all.cfor
 
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import scala.annotation.tailrec
 import scala.collection.concurrent.TrieMap
 import scala.collection.mutable
@@ -45,6 +46,12 @@ trait InputBlocksProcessor extends ScorexLogging {
     * @return interface to read objects from history database
     */
   def historyReader: ErgoHistoryReader
+
+  /**
+    * Whether input-block uncles are enabled (node setting `inputBlockUncles`). When disabled, uncle references
+    * are ignored: nothing is credited, there are no uncle candidates and no sibling is relayed.
+    */
+  protected def inputBlockUnclesEnabled: Boolean
 
   private val PruningThreshold = 2 // we remove input-blocks data after 2 ordering blocks
 
@@ -692,6 +699,22 @@ trait InputBlocksProcessor extends ScorexLogging {
   private val inputBlockRecords = TrieMap[ModifierId, InputBlockAnnouncement]()
 
   /**
+    * Uncles enabled only: input block id -> local arrival number of its announcement (first seen). The generator
+    * takes uncle candidates in this order, not by miner timestamps.
+    */
+  private val inputBlockArrival = TrieMap[ModifierId, Long]()
+
+  private val arrivalCounter = new AtomicLong(0L)
+
+  /**
+    * Uncles enabled only: input block id -> the uncles it references which pass the uncle rule ("credited
+    * uncles"). Header-level only: nothing about state or collected transactions depends on it. Re-evaluated for
+    * the whole ordering block whenever one of its announcements arrives, so a reference to a sibling not seen yet
+    * is credited once the sibling's announcement arrives.
+    */
+  private val creditedUncles = TrieMap[ModifierId, Seq[ModifierId]]()
+
+  /**
     * input block id -> input block transaction ids index
     */
   // todo: transactions can be put here without input block received, ie PoW and difficulty checked
@@ -814,6 +837,8 @@ trait InputBlocksProcessor extends ScorexLogging {
       }
       // Also remove associated transaction data
       inputBlockTransactions.remove(id)
+      inputBlockArrival.remove(id)
+      creditedUncles.remove(id)
     }
 
     val OrderingBlockAnnouncementPruningThreshold = PruningThreshold * 3
@@ -892,6 +917,9 @@ trait InputBlocksProcessor extends ScorexLogging {
       }
 
       inputBlockRecords.put(ib.id, ib)
+      if (inputBlockUnclesEnabled) {
+        inputBlockArrival.put(ib.id, arrivalCounter.incrementAndGet())
+      }
 
       /**
         * @return an optional if of input block to download
@@ -909,7 +937,7 @@ trait InputBlocksProcessor extends ScorexLogging {
         }
       }
 
-      inputBlockTrees.get(orderingId) match {
+      val toDownload = inputBlockTrees.get(orderingId) match {
         case Some(tree) =>
           log.debug(s"Adding input block ${ib.id} to existing tree for ordering block $orderingId")
           updateTree(tree)
@@ -919,6 +947,13 @@ trait InputBlocksProcessor extends ScorexLogging {
           inputBlockTrees.put(orderingId, tree)
           updateTree(tree)
       }
+
+      // header-level uncles: credit of this block, and of blocks referencing it or descending from it
+      if (inputBlockUnclesEnabled) {
+        refreshUncleCredits(orderingId)
+      }
+
+      toDownload
     } catch {
       case t: Throwable =>
         log.error(s"Can't apply input block ${ib.id}", t)
@@ -1002,6 +1037,104 @@ trait InputBlocksProcessor extends ScorexLogging {
         Seq.empty -> Seq.empty
     }
 
+  }
+
+  /**
+    * Uncle ids an input block references in its committed field: the ids repeated by a version 2 announcement
+    * whose uncles leaf is proven against the header's extension root. None if the field is absent, was stripped
+    * by a relay, or is malformed: no credit then, the block itself is processed as any other.
+    */
+  private def committedUncleIds(ib: InputBlockAnnouncement): Option[Seq[ModifierId]] = {
+    if (ib.unclesCommitted && ib.merkleProof.valid(ib.header.extensionRoot)) ib.uncleIdsOpt else None
+  }
+
+  /**
+    * Input blocks from the first one of an ordering block up to and including `id`, following the parent links
+    * of known announcements of the same ordering block (whether their transactions were processed or not).
+    * None if a link is not known yet.
+    */
+  private def knownChainOf(id: ModifierId): Option[Seq[ModifierId]] = {
+    val maxSteps = inputBlockRecords.size
+    @tailrec
+    def loop(ib: InputBlockAnnouncement, acc: List[ModifierId], steps: Int): Option[List[ModifierId]] = {
+      ib.prevInputBlockId match {
+        case None => Some(ib.id :: acc)
+        case Some(parentId) =>
+          inputBlockRecords.get(parentId) match {
+            case Some(parent) if parent.header.parentId == ib.header.parentId && steps < maxSteps =>
+              loop(parent, ib.id :: acc, steps + 1)
+            case _ => None
+          }
+      }
+    }
+    inputBlockRecords.get(id).flatMap(ib => loop(ib, Nil, 0))
+  }
+
+  /** Uncles credited to the blocks given. */
+  private def creditedAlong(ids: Seq[ModifierId]): Set[ModifierId] =
+    ids.flatMap(id => creditedUncles.getOrElse(id, Seq.empty)).toSet
+
+  /**
+    * The uncle rule shared by the validator (credit) and the generator (candidates): `u` may be credited to an
+    * input block of the ordering block `orderingId` whose ancestors (the chain from the first input block up to
+    * and including its parent) are `ancestors`, given the uncles `creditedBefore` already credited along them.
+    * An uncle is a known (so PoW-checked) input block of the same ordering block, not on the chain, whose parent
+    * is on the chain (or which has no parent), credited at most once along a chain.
+    *
+    * @return why `u` is not credited, None if it is
+    */
+  private def uncleRuleViolation(orderingId: ModifierId,
+                                 ancestors: Set[ModifierId],
+                                 creditedBefore: Set[ModifierId],
+                                 u: ModifierId): Option[String] = {
+    if (ancestors.contains(u)) {
+      Some(s"uncle $u is an element of the chain")
+    } else if (creditedBefore.contains(u)) {
+      Some(s"uncle $u is already credited along the chain")
+    } else {
+      inputBlockRecords.get(u) match {
+        case None => Some(s"uncle $u is not known")
+        case Some(r) if r.header.parentId != orderingId => Some(s"uncle $u belongs to another ordering block")
+        case Some(r) if !r.prevInputBlockId.forall(ancestors.contains) =>
+          Some(s"parent of uncle $u is not on the chain")
+        case Some(_) => None
+      }
+    }
+  }
+
+  /** Uncles credited to `ib`, whose ancestors are `ancestors` (their credit is already evaluated). */
+  private def creditFor(ib: InputBlockAnnouncement, ancestors: Seq[ModifierId]): Seq[ModifierId] = {
+    committedUncleIds(ib) match {
+      case Some(ids) if ids.nonEmpty =>
+        InputBlockUncles.fieldViolation(ib.id, ids) match {
+          case Some(reason) =>
+            log.debug(s"No uncle credit for input block ${ib.id}: $reason")
+            Seq.empty
+          case None =>
+            val ancestorSet = ancestors.toSet
+            val creditedBefore = creditedAlong(ancestors)
+            ids.filter { u =>
+              val violation = uncleRuleViolation(ib.header.parentId, ancestorSet, creditedBefore, u)
+              violation.foreach(reason => log.debug(s"Uncle reference of input block ${ib.id} not credited: $reason"))
+              violation.isEmpty
+            }
+        }
+      case _ => Seq.empty
+    }
+  }
+
+  /**
+    * Re-evaluates the credited uncles of all known input blocks of an ordering block, ancestors first. A block
+    * whose chain is not fully known yet gets no credit until it is.
+    */
+  private def refreshUncleCredits(orderingId: ModifierId): Unit = {
+    val chains = inputBlockRecords.values.toSeq
+      .filter(_.header.parentId == orderingId)
+      .map(ib => ib -> knownChainOf(ib.id))
+    chains.sortBy(_._2.map(_.length).getOrElse(0)).foreach {
+      case (ib, Some(chain)) => creditedUncles.put(ib.id, creditFor(ib, chain.init))
+      case (ib, None) => creditedUncles.put(ib.id, Seq.empty)
+    }
   }
 
   /**
@@ -1264,6 +1397,58 @@ trait InputBlocksProcessor extends ScorexLogging {
     orderingBlockId: ModifierId
   ): Option[Seq[ErgoTransaction]] = {
     orderingBlockTransactions.get(orderingBlockId)
+  }
+
+  // Header-level input-block uncles
+
+  /**
+    * @return uncles referenced by the input block which passed the uncle rule (always empty with uncles disabled)
+    */
+  def getCreditedUncles(id: ModifierId): Seq[ModifierId] = creditedUncles.getOrElse(id, Seq.empty)
+
+  /**
+    * Uncles for a new input block built on the best input block of the best ordering block (uncles enabled
+    * only): up to `InputBlockUncles.MaxUncles` known input blocks passing the uncle rule for it, first seen first.
+    */
+  def uncleCandidates(): Seq[ModifierId] = {
+    if (!inputBlockUnclesEnabled) {
+      Seq.empty
+    } else {
+      val (orderingOpt, parentOpt) = bestBlocks
+      val ancestorsOpt = parentOpt match {
+        case Some(parent) => knownChainOf(parent.id)
+        case None => Some(Seq.empty)
+      }
+      (orderingOpt, ancestorsOpt) match {
+        case (Some(ordering), Some(ancestors)) =>
+          val ancestorSet = ancestors.toSet
+          val creditedBefore = creditedAlong(ancestors)
+          inputBlockRecords.values.toSeq
+            .filter { r =>
+              r.header.parentId == ordering.id &&
+                uncleRuleViolation(ordering.id, ancestorSet, creditedBefore, r.id).isEmpty
+            }
+            .sortBy(r => inputBlockArrival.getOrElse(r.id, Long.MaxValue))
+            .take(InputBlockUncles.MaxUncles)
+            .map(_.id)
+        case _ => Seq.empty
+      }
+    }
+  }
+
+  /**
+    * Whether an input block announcement not known yet is a sibling (uncles enabled only): it belongs to the best
+    * ordering block and its parent (or the ordering block, for a first input block) already has a known child.
+    * Such an announcement is relayed so that miners can reference it; one extending the chain is relayed as
+    * before, when it becomes the best input block.
+    */
+  def isSiblingAnnouncement(ib: InputBlockAnnouncement): Boolean = {
+    inputBlockUnclesEnabled &&
+      !inputBlockRecords.contains(ib.id) &&
+      bestOrderingBlock().map(_.id).contains(ib.header.parentId) &&
+      inputBlockRecords.values.exists { r =>
+        r.header.parentId == ib.header.parentId && r.prevInputBlockId == ib.prevInputBlockId
+      }
   }
 
 }

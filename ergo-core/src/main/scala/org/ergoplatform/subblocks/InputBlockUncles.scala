@@ -8,12 +8,13 @@ import scorex.crypto.hash.Digest32
 import scorex.util.{ModifierId, bytesToId, idToBytes}
 
 /**
-  * Constants and encodings for input-block uncles: siblings (input blocks whose parent is an earlier element of
-  * the chain) merged by a later input block, so that their transactions are collected and their work counts.
+  * Constants and encodings for header-level input-block uncles: PoW-valid siblings (input blocks of the same
+  * ordering block whose parent is on the chain of a later input block) referenced by that later block for credit.
+  * Only the reference counts: an uncle's transactions are not executed or collected.
   *
   * Where references live:
   *  - extension field `Extension.InputBlockUnclesKey` (0x03 0x03): concatenation of up to `MaxUncles` 32-byte
-  *    ids, empty when the block merges no uncles. The extension root committed by the header covers it.
+  *    ids. The extension root committed by the header covers it.
   *  - input block announcement (message version `UnclesMessageVersion`): the bytes after the version 1 fields
   *    (`unparsedBytes`) start with the number of uncles followed by their ids. Bytes after that are left for
   *    future fields. The batch Merkle proof of the announcement includes the uncles leaf, so the ids it repeats
@@ -26,6 +27,25 @@ object InputBlockUncles {
 
   /** Input block announcement version carrying uncle ids. */
   val UnclesMessageVersion: Byte = 2.toByte
+
+  /**
+    * The field rule shared by the generator and the validator: at most `MaxUncles` ids, no duplicate, and no
+    * reference of the block to itself.
+    *
+    * @param selfId - id of the referencing block
+    * @return why the field is not well-formed, None if it is
+    */
+  def fieldViolation(selfId: ModifierId, ids: Seq[ModifierId]): Option[String] = {
+    if (ids.length > MaxUncles) {
+      Some(s"${ids.length} uncles, at most $MaxUncles allowed")
+    } else if (ids.distinct.length != ids.length) {
+      Some("duplicate uncle id")
+    } else if (ids.contains(selfId)) {
+      Some("block references itself")
+    } else {
+      None
+    }
+  }
 
   /** Extension field value for the uncle ids given. */
   def fieldValue(ids: Seq[Array[Byte]]): Array[Byte] = Array.concat(ids: _*)
