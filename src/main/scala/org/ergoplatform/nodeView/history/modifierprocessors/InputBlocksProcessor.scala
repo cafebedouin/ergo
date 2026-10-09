@@ -1023,7 +1023,22 @@ trait InputBlocksProcessor extends ScorexLogging {
               log.debug(s"Processing input block transactions for $sbId in tree with ${tree.forks.length} forks")
               val (forward, rollback) = tree.processInputBlockTransactions(ib, transactions, state)
               log.info(s"Input block transaction processing completed: ${forward.length} forward, ${rollback.length} rollback")
-              (forward, rollback)
+              if (inputBlockUnclesEnabled && forward.isEmpty) {
+                // a sibling's body fetched late (see inputBlockBodyWanted): the fork choice evaluates the depth of
+                // the block whose body arrives, so a descendant whose body came first is processed again now
+                deepestDescendantWithBody(sbId) match {
+                  case Some((descendant, descendantTxs)) =>
+                    inputBlockTrees.get(orderingId) match {
+                      case Some(updTree) =>
+                        log.info(s"Processing input block ${descendant.id} again after the body of its ancestor $sbId")
+                        updTree.processInputBlockTransactions(descendant, descendantTxs, state)
+                      case None => (forward, rollback)
+                    }
+                  case None => (forward, rollback)
+                }
+              } else {
+                (forward, rollback)
+              }
             case None =>
               log.warn(s"No tree found for ordering block $orderingId when processing input block $sbId")
               Seq.empty -> Seq.empty
@@ -1403,6 +1418,88 @@ trait InputBlocksProcessor extends ScorexLogging {
   }
 
   // Header-level input-block uncles
+
+  /**
+    * Known input blocks from the first one of an ordering block up to and including `id`, following parent links of
+    * known announcements of the same ordering block, as far back as they are known.
+    */
+  private def knownAncestry(id: ModifierId): Seq[ModifierId] = {
+    val maxSteps = inputBlockRecords.size
+    @tailrec
+    def loop(ib: InputBlockAnnouncement, acc: List[ModifierId], steps: Int): List[ModifierId] = {
+      ib.prevInputBlockId.flatMap(inputBlockRecords.get) match {
+        case Some(parent) if parent.header.parentId == ib.header.parentId && steps < maxSteps =>
+          loop(parent, ib.id :: acc, steps + 1)
+        case _ => ib.id :: acc
+      }
+    }
+    inputBlockRecords.get(id).map(ib => loop(ib, Nil, 0)).getOrElse(Nil)
+  }
+
+  /**
+    * Transactions of the chain through an input block (from the first input block of its ordering block up to and
+    * including it), from the bodies stored. Empty for None (no parent: the ordering block). Used to check that an
+    * input-block solution does not repeat its parent's or prefix's transactions.
+    */
+  def chainTransactionsThrough(idOpt: Option[ModifierId]): Seq[ErgoTransaction] = {
+    idOpt.toSeq.flatMap(knownAncestry).flatMap(id => getInputBlockTransactions(id).getOrElse(Seq.empty))
+  }
+
+  /**
+    * Whether the transactions (body) of a new input block announcement should be fetched. With uncles disabled, or
+    * for another ordering block than the best one, always (as without uncles support). Otherwise only when the
+    * block's branch would be longer than the processed best chain (it extends the best chain, or makes a sibling
+    * branch long enough for the fork choice to switch to it), when its chain is not known, or when a known block
+    * already builds on it. A sibling not meeting this is processed as an announcement only.
+    */
+  def inputBlockBodyWanted(ib: InputBlockAnnouncement): Boolean = {
+    !inputBlockUnclesEnabled || !bestOrderingBlock().map(_.id).contains(ib.header.parentId) || {
+      val processedDepth = inputBlocksTree().map(_.bestChain.length).getOrElse(0)
+      val depthOpt = ib.prevInputBlockId match {
+        case None => Some(1)
+        case Some(parentId) => knownChainOf(parentId).map(_.length + 1)
+      }
+      depthOpt.forall(_ > processedDepth) || inputBlockRecords.values.exists(_.prevInputBlockId.contains(ib.id))
+    }
+  }
+
+  /**
+    * Uncles enabled only: known ancestors of an input block, nearest first, stored without a body (siblings whose
+    * transactions were not fetched), up to the first one with a body. Their bodies are fetched when a block
+    * building on them arrives.
+    */
+  def bodilessAncestors(ib: InputBlockAnnouncement): Seq[InputBlockAnnouncement] = {
+    if (!inputBlockUnclesEnabled) {
+      Seq.empty
+    } else {
+      val maxSteps = inputBlockRecords.size
+      @tailrec
+      def loop(prevOpt: Option[ModifierId], acc: List[InputBlockAnnouncement], steps: Int): List[InputBlockAnnouncement] = {
+        prevOpt.flatMap(inputBlockRecords.get) match {
+          case Some(parent) if parent.header.parentId == ib.header.parentId && steps < maxSteps &&
+            !inputBlockTransactions.contains(parent.id) =>
+            loop(parent.prevInputBlockId, parent :: acc, steps + 1)
+          case _ => acc.reverse
+        }
+      }
+      loop(ib.prevInputBlockId, Nil, 0)
+    }
+  }
+
+  /**
+    * The deepest known descendant of an input block (same ordering block) whose body is stored, with its
+    * transactions, if any.
+    */
+  private def deepestDescendantWithBody(id: ModifierId): Option[(InputBlockAnnouncement, Seq[ErgoTransaction])] = {
+    inputBlockRecords.get(id).flatMap { ib =>
+      inputBlockRecords.values.toSeq
+        .filter(r => r.id != id && r.header.parentId == ib.header.parentId && inputBlockTransactions.contains(r.id))
+        .flatMap(r => knownChainOf(r.id).filter(_.contains(id)).map(chain => (r, chain.length)))
+        .sortBy(-_._2)
+        .headOption
+        .flatMap { case (r, _) => getInputBlockTransactions(r.id).map(txs => r -> txs) }
+    }
+  }
 
   /**
     * @return uncles referenced by the input block which passed the uncle rule (always empty with uncles disabled)
