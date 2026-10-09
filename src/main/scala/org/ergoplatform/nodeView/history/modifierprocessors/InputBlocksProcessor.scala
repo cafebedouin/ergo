@@ -617,13 +617,22 @@ trait InputBlocksProcessor extends ScorexLogging {
           var updTree  = new InputBlocksTree(forks.updated(longestIndex, r._1))
           val updForks = updTree.forks
 
-          // Register completion for any other forks that were waiting for this block.
-          // They share its prefix, so its cost is the one just measured.
-          val ibCost = r._1.processedBlocks(r._1.depthOf(ib.id))
+          // Register completion for any other forks that were waiting for this block. applicationStep may have
+          // processed the blocks after it too (r._2, in chain order): advance each fork through them while it
+          // shares them. A fork that shares a block shares its prefix, so its cost is the one just measured.
           (0 until updForks.length).foreach { idx =>
             val f = updForks(idx)
             if (f.firstToComplete().contains(ib.id)) {
-              f.registerCompletion(ib.id, costDelta = ibCost) match {
+              val completed = r._2.foldLeft(Try(f)) { (acc, id) =>
+                acc.flatMap { c =>
+                  if (c.firstToComplete().contains(id)) {
+                    c.registerCompletion(id, costDelta = r._1.processedBlocks(r._1.depthOf(id)))
+                  } else {
+                    Success(c)
+                  }
+                }
+              }
+              completed match {
                 case Success(ibc) =>
                   updTree = new InputBlocksTree(updTree.forks.updated(idx, ibc))
                 case Failure(e) =>
@@ -648,13 +657,22 @@ trait InputBlocksProcessor extends ScorexLogging {
           var updTree  = new InputBlocksTree(forks.updated(bestIndex, r._1))
           val updForks = updTree.forks
 
-          // Register completion for any other forks that were waiting for this block.
-          // They share its prefix, so its cost is the one just measured.
-          val ibCost = r._1.processedBlocks(r._1.depthOf(ib.id))
+          // Register completion for any other forks that were waiting for this block. applicationStep may have
+          // processed the blocks after it too (r._2, in chain order): advance each fork through them while it
+          // shares them. A fork that shares a block shares its prefix, so its cost is the one just measured.
           (0 until updForks.length).foreach { idx =>
             val f = updForks(idx)
             if (f.firstToComplete().contains(ib.id)) {
-              f.registerCompletion(ib.id, costDelta = ibCost) match {
+              val completed = r._2.foldLeft(Try(f)) { (acc, id) =>
+                acc.flatMap { c =>
+                  if (c.firstToComplete().contains(id)) {
+                    c.registerCompletion(id, costDelta = r._1.processedBlocks(r._1.depthOf(id)))
+                  } else {
+                    Success(c)
+                  }
+                }
+              }
+              completed match {
                 case Success(ibc) =>
                   updTree = new InputBlocksTree(updTree.forks.updated(idx, ibc))
                 case Failure(e) =>
