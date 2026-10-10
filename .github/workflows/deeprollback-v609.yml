@@ -1,0 +1,69 @@
+# DeepRollBackSpec on v6.0.9 (cc60d65d2), in the context upstream CI runs it: the whole it:test suite.
+# Variants (patches in .ci/patches, applied in order):
+#   base          v6.0.9 as is
+#   iso-fixture   + #2535's isolation (maxConnections = 0 while mining, empty-peer assertion)
+#                 + the fixture fix (stop B only once its headers and full blocks agree)
+#   full          + the V2 summary clamp (ErgoHistoryReader.syncInfoV2) + the scan-back (ToDownloadProcessor)
+# Every job records the commit and the applied patches, and uploads the sbt output, the node logs and the it reports.
+name: DeepRollBackSpec v6.0.9 A/B
+on:
+  push:
+    branches: [ 'ci/deeprollback-v609' ]
+jobs:
+  it:
+    name: ${{ matrix.variant }} run ${{ matrix.rep }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [ base, full ]
+        rep: [ 1 ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: it
+          fetch-depth: 0
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Apply the variant's patches
+        run: |
+          cd it
+          case "${{ matrix.variant }}" in
+            base) patches="" ;;
+            iso-fixture) patches="iso fixture" ;;
+            full) patches="iso fixture clamp scanback" ;;
+            *) echo "unknown variant"; exit 1 ;;
+          esac
+          echo "commit $(git rev-parse HEAD)"
+          for p in $patches; do git apply ".ci/patches/$p.diff"; echo "applied $p sha256 $(sha256sum .ci/patches/$p.diff | cut -c1-16)"; done
+          git diff --stat
+      - name: it:test (whole suite, as upstream CI)
+        timeout-minutes: 40
+        run: |
+          cd it
+          mkdir -p tmp
+          set -o pipefail
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 it:test 2>&1 | tee sbt-it.log
+      - name: Save leftover node container logs
+        if: always()
+        run: |
+          mkdir -p it/target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker logs --timestamps "$id" > "it/target/logs/containers/$name.log" 2>&1 || true
+            done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: drb609-${{ matrix.variant }}-${{ matrix.rep }}
+          path: |
+            it/sbt-it.log
+            it/target/logs/
+            it/target/it-reports/
+          if-no-files-found: warn
+          retention-days: 30
