@@ -402,7 +402,8 @@ trait ErgoHistoryReader
         ErgoHistoryReader.ReducedV2SyncOffsets
       }
 
-      val headers = offsets.flatMap(offset => bestHeaderAtHeight(h - offset))
+      // An offset below genesis samples genesis, so a young chain's summary still reaches the shared prefix.
+      val headers = offsets.map(offset => Math.max(GenesisHeight, h - offset)).distinct.flatMap(bestHeaderAtHeight)
 
       ErgoSyncInfoV2(headers)
     }
