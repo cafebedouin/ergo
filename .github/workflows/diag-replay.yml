@@ -1,0 +1,75 @@
+name: diag-replay
+# Replays the witness runs a review or PR text cites (diag/replay.sh: each step with its expected outcome; the job
+# fails if any outcome differs), and runs the node test suite with this branch's miner thread and with the previous
+# PR head's, listing the failing tests of each. Diagnostic branch, not for merge; runs on pushes to ci/2639-round3.
+on:
+  push:
+    branches: [ 'ci/2639-round3' ]
+  workflow_dispatch:
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+      - name: Replay
+        run: bash diag/replay.sh
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-${{ github.run_id }}
+          path: diag/out/
+          if-no-files-found: warn
+          retention-days: 30
+  node:
+    strategy:
+      fail-fast: false
+      matrix:
+        thread: [ this-branch, previous-head-7ea4cf2a3 ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: olafurpg/setup-scala@v10
+        with:
+          java-version: adopt@1.8
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: Build pinned SigmaState dependency
+        uses: ./.github/actions/bootstrap-sigmastate
+        with:
+          scala-version: 2.12.20
+      - name: Node tests (sbt -Denv=test clean test, as upstream's node job)
+        run: bash diag/node.sh "${{ matrix.thread }}"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.thread }}-${{ github.run_id }}
+          path: diag/out/
+          if-no-files-found: warn
+          retention-days: 30
