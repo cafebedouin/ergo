@@ -114,6 +114,39 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
     snapshot(phase, "A", nodeA, budget).zip(snapshot(phase, "B", nodeB, budget))
   }
 
+  /** A node mines only while headersHeight < fullBlockHeight + 6 (ErgoMiner.isBlockchainNearlySynced,
+    * ErgoMiner.scala:123), so a miner restarted without peers needs headersHeight - fullBlockHeight < 6.
+    */
+  private val MinerStartLeadBound = 6
+
+  /** Polls `node` until both heights are defined, headersHeight - fullBlockHeight < `leadBelow`, and both heights
+    * are unchanged over `stableSamples` consecutive samples; fails (TimeoutException) otherwise.
+    */
+  private def waitForSettledHeights(
+    phase: String,
+    label: String,
+    node: Node,
+    leadBelow: Int,
+    stableSamples: Int = 3,
+    interval: FiniteDuration = 1.second,
+    timeout: FiniteDuration = 2.minutes
+  ): Future[(Int, Int)] = {
+    var recent = Vector.empty[(Int, Int)]
+    observations.until(timeout.fromNow, interval, 5.seconds)(budget => snapshot(phase, label, node, budget)) {
+      observed =>
+        val heights = for {
+          info <- observed.info
+          headers <- info.bestHeaderHeightOpt
+          full <- info.bestBlockHeightOpt
+        } yield (headers, full)
+        recent = heights.fold(Vector.empty[(Int, Int)])(h => (recent :+ h).takeRight(stableSamples))
+        recent.size == stableSamples && recent.distinct.size == 1 && recent.head._1 - recent.head._2 < leadBelow
+    }(
+      s"Node $label did not settle with headersHeight - fullBlockHeight < $leadBelow; " +
+        s"recent observations: $lastObservation"
+    ).map(_ => recent.last)
+  }
+
   private def waitForNoPeers(phase: String, nodes: Seq[(String, Node)]): Future[Unit] = {
     observations.until(30.seconds.fromNow, 1.second, 5.seconds) { budget =>
       Future.traverse(nodes) { case (label, node) =>
@@ -171,8 +204,15 @@ class DeepRollBackSpec extends AnyFreeSpec with IntegrationSuite {
       genesisAGen shouldBe genesisBGen
       Async.await(observeNodes("initial shared chain", minerAGen, minerBGen))
 
-      // 2. Stop all nodes
+      // 2. Stop all nodes. B is restarted without peers and must then mine, so when it stops its
+      // headersHeight - fullBlockHeight must be < 6 (MinerStartLeadBound). Stop A once B is level, which ends B's
+      // inflow, then stop B once its heights are defined, settled and within that bound.
+      Async.await(waitForSettledHeights("before stopping A", "B", minerBGen, leadBelow = 1, stableSamples = 1,
+        interval = 100.millis, timeout = 5.minutes))
       docker.stopNode(minerAGen.containerId)
+      val minerBAtStop =
+        Async.await(waitForSettledHeights("before stopping B", "B", minerBGen, leadBelow = MinerStartLeadBound))
+      log.info(s"B settled before stopping: headersHeight=${minerBAtStop._1} fullHeight=${minerBAtStop._2}")
       docker.stopNode(minerBGen.containerId)
       clearPeerDatabases()
 
