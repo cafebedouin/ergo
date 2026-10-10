@@ -15,7 +15,10 @@ repeats, existing specs match the baseline, and a mutation crediting nothing tur
 properties red. Round 3 was verified on GitHub and rechecked on the network (18 runs). Round 4 was verified on GitHub (compiled with no fixes, new specs green, no regression, each change killed by
 a mutant). Round 5 likewise (zero compile fixes, specs green over 2 repeats, no regression, each fix killed by
 its mutant). **Rounds 2 to 6 (see the end of this
-file) were not compiled or run here either; round 6 has not been compiled anywhere yet.**
+file) were not compiled or run here either.** Round 6 was then verified on GitHub (compiled with no fixes, new specs
+green over 2 repeats, the new on-demand path killed by its mutant; one timing test, OrderingBlockMessageFlowSpec, was
+red in 2 of 7 round-6 jobs against 0 of 17 on the starting branch, an open watch item) and run on the network as the
+header-level build of the final run set (21 dispatches, 76 runs).
 
 **Round 1 was written without compiling or running anything here.** The session had no sbt, and Maven Central was blocked
 by the network proxy (HTTP 403). The code was written by reading the surrounding types.
