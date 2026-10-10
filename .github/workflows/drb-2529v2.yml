@@ -1,0 +1,58 @@
+# DeepRollBackSpec on ergoplatform/ergo#2529 (head 561e5c3a4, base master) + one test-only commit (036e93226: stop B
+# only once its heights are settled within the miner start bound), in the context upstream CI runs it: the whole it:test suite.
+# No patches are applied in the job: the tested tree is 036e93226 + this workflow file. Smoke (branch *-smoke) runs 1
+# job, counted (branch *-counted) runs 4. Each job logs the commits and uploads the sbt output, node logs, it reports.
+name: DeepRollBackSpec on 2529 + hardened fixture
+on:
+  push:
+    branches: [ 'ci/drb-2529v2-*' ]
+jobs:
+  it:
+    name: drb2529v2 run ${{ matrix.rep }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        rep: ${{ fromJSON(endsWith(github.ref_name, '-counted') && '[1,2,3,4]' || '[1]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: it
+          fetch-depth: 0
+      - name: Setup Java and Scala
+        uses: coursier/setup-action@v3
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - name: Record the tested tree
+        run: |
+          cd it
+          git log -3 --format='commit %H %s'
+          git diff --stat 561e5c3a408327f45a0aac1bd1cf2740cf8a04b6 HEAD
+      - name: it:test (whole suite, as upstream CI)
+        timeout-minutes: 40
+        run: |
+          cd it
+          mkdir -p tmp
+          set -o pipefail
+          TMPDIR=$(pwd)/tmp sbt -Denv=test clean ++2.12.20 it:test 2>&1 | tee sbt-it.log
+      - name: Save leftover node container logs
+        if: always()
+        run: |
+          mkdir -p it/target/logs/containers
+          docker ps -a --filter name=ergo-itest- --format '{{.ID}} {{.Names}}' |
+            while read -r id name; do
+              docker logs --timestamps "$id" > "it/target/logs/containers/$name.log" 2>&1 || true
+            done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: drb2529v2-${{ endsWith(github.ref_name, '-counted') && 'counted' || 'smoke' }}-${{ matrix.rep }}
+          path: |
+            it/sbt-it.log
+            it/target/logs/
+            it/target/it-reports/
+          if-no-files-found: warn
+          retention-days: 30
