@@ -1,0 +1,50 @@
+name: diag-v609-drbuss
+# DeepRollBackSpec and UtxoStateNodesSyncSpec on the v6.0.9 tip (no PR), one sbt invocation per job, each job
+# uploading every node's container log (target/logs) and the sbt output. Runs on pushes to diag/v609-drbuss-* only.
+# The job records the tested tree: the commit, its parent, and the diff against the v6.0.9 tip (only this file).
+on:
+  push:
+    branches: [ 'diag/v609-drbuss-*' ]
+jobs:
+  drbuss:
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [ 1, 2, 3, 4, 5, 6, 7, 8 ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tested tree
+        run: |
+          git log -2 --format='%H %s'
+          git diff --stat 4f354391d144049160ebf0eda4fa1bab56cc85ef HEAD
+      - uses: coursier/setup-action@v1
+        with:
+          jvm: temurin:8
+          apps: sbt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.sbt
+            ~/.ivy2/cache
+            ~/.cache/coursier/v1
+          key: ${{ runner.os }}-sbt-cache-v4-${{ hashFiles('**/*.sbt') }}-${{ hashFiles('project/build.properties') }}
+      - name: DeepRollBackSpec + UtxoStateNodesSyncSpec
+        timeout-minutes: 50
+        run: |
+          mkdir -p tmp
+          set -o pipefail
+          TMPDIR=$(pwd)/tmp sbt -Denv=test ++2.12.20 docker "it:testOnly org.ergoplatform.it.DeepRollBackSpec org.ergoplatform.it.UtxoStateNodesSyncSpec" 2>&1 | tee sbt-output.log
+      - name: Upload node logs and sbt output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drbuss-run-${{ matrix.run }}
+          path: |
+            target/logs/
+            sbt-output.log
+          if-no-files-found: warn
+          retention-days: 14
