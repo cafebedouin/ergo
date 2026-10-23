@@ -106,14 +106,17 @@ trait ToDownloadProcessor
         // when blockchain is about to be synced,
         // download children blocks of last 100 full blocks applied to the best chain, to get block sections from forks
         // (but not below minimal full block height: block sections below it fail `bsTooOld` validation and their sender
-        // is penalized, and there could be no headers below it, e.g. after NiPoPoW bootstrap)
+        // is penalized, and there could be no headers below it, e.g. after NiPoPoW bootstrap; the exception is a
+        // successor of the best full block, which passes `bsTooOld` and is needed to catch up when a restart moved
+        // the floor above the best full block, see shouldDownloadBlockAtHeight)
+        val lowestHeight = Math.min(minimalFullBlockHeight, fb.header.height + 1)
         val lookbackHeight = Math.max(1, fb.header.height - 100)
-        val minHeight = if (lookbackHeight > minimalFullBlockHeight) {
+        val minHeight = if (lookbackHeight > lowestHeight) {
           commonAncestorOf(fb)
-            .map(h => Math.max(minimalFullBlockHeight, h.height + 1))
+            .map(h => Math.max(lowestHeight, h.height + 1))
             .fold(lookbackHeight)(Math.min(lookbackHeight, _))
         } else {
-          Math.max(minimalFullBlockHeight, fb.header.height - 100)
+          Math.max(lowestHeight, fb.header.height - 100)
         }
         continuation(minHeight, Map.empty, maxHeight = Int.MaxValue)
       case None if (nodeSettings.utxoSettings.utxoBootstrap && !isUtxoSnapshotApplied) =>
