@@ -621,4 +621,21 @@ class ErgoWalletServiceSpec
     }
   }
 
+  property("a message signed without an address is signed for the wallet's first listed address") {
+    withVersionedStore(2) { versionedStore =>
+      withStore { store =>
+        // unlocked as the node unlocks a wallet: the master key comes first in the prover and, with EIP-3
+        // keys after it, is not one of the addresses the wallet lists
+        val unlocked = processUnlock(initialState(store, versionedStore), masterKey,
+          usePreEip3Derivation = false).get
+        val listed = unlocked.walletVars.publicKeyAddresses
+        listed.contains(P2PKAddress(masterKey.publicKey.key)(settings.addressEncoder)) shouldBe false
+
+        val signed = new ErgoWalletServiceImpl(settings).signMessage(unlocked, messageToSign, None).get
+        signed.address shouldBe listed.head
+        MessageSigning.verify(listed.head.pubkey, signed.signedMessage, signed.proof) shouldBe true
+      }
+    }
+  }
+
 }

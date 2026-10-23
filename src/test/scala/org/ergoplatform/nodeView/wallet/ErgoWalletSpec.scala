@@ -12,6 +12,7 @@ import org.ergoplatform.utils._
 import org.ergoplatform.utils.fixtures.WalletFixture
 import org.ergoplatform.wallet.boxes.BoxSelector.MinBoxValue
 import org.ergoplatform.wallet.boxes.ErgoBoxSerializer
+import org.ergoplatform.wallet.crypto.MessageSigning
 import org.ergoplatform.wallet.interpreter.{ErgoInterpreter, TransactionHintsBag}
 import org.scalacheck.Gen
 import org.scalatest.concurrent.Eventually
@@ -1124,6 +1125,22 @@ class ErgoWalletSpec extends ErgoCorePropertyTest with WalletTestOps with Eventu
         val txSigned = await(wallet.signTransaction(utx, Seq(es1), hints, Some(Seq(in)), None)).get
         txSigned.statelessValidity().isSuccess shouldBe true
       }
+    }
+  }
+
+  property("a message signed through the wallet actor verifies for its address and for no other") {
+    withFixture { implicit w =>
+      val addresses = getPublicKeys
+      addresses.length should be > 1
+      val message = "I am the owner of this address".getBytes("UTF-8")
+
+      val signed = await(wallet.signMessage(message, Some(addresses.last))).get
+      signed.address shouldBe addresses.last
+      MessageSigning.unwrap(signed.signedMessage).get.toSeq shouldBe message.toSeq
+      MessageSigning.verify(addresses.last.pubkey, signed.signedMessage, signed.proof) shouldBe true
+      MessageSigning.verify(addresses.head.pubkey, signed.signedMessage, signed.proof) shouldBe false
+
+      await(wallet.signMessage(message, None)).get.address shouldBe addresses.head
     }
   }
 
