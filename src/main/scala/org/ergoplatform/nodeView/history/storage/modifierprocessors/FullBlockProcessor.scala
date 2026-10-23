@@ -109,7 +109,9 @@ trait FullBlockProcessor extends HeadersProcessor {
           val lastKept = updateBestFullBlock(fullBlock.header)
           val bestHeight: Int = newBestBlockHeader.height
           val diff = bestHeight - prevBest.header.height
-          pruneBlockDataAt(((lastKept - diff) until lastKept).filter(_ >= 0))
+          // A node catching up applies blocks below the floor (see shouldDownloadBlockAtHeight), so the new best
+          // full block can sit in the pruned range; keep it, or the node cannot assemble its best full block
+          pruneBlockDataAt(((lastKept - diff) until lastKept).filter(h => h >= 0 && h < bestHeight))
         }
         ProgressInfo(branchPoint, toRemove, toApply, Seq.empty)
       }
