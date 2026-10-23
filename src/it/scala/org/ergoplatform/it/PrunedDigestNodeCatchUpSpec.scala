@@ -39,7 +39,7 @@ class PrunedDigestNodeCatchUpSpec
     .withFallback(blockIntervalConfig(500))
     .withFallback(specialDataDirConfig(remoteVolume))
     .withFallback(nodeSeedConfigs.head)
-    .withFallback(localOnlyConfig)
+    .withFallback(allowLocalConfig)
 
   // pruning light (digest) node that syncs, goes offline, then has to catch up
   private val digestConfig: Config = digestStatePeerConfig
@@ -48,7 +48,7 @@ class PrunedDigestNodeCatchUpSpec
     .withFallback(nonGeneratingPeerConfig)
     .withFallback(specialDataDirConfig(remoteVolume))
     .withFallback(nodeSeedConfigs(1))
-    .withFallback(localOnlyConfig)
+    .withFallback(allowLocalConfig)
 
   // Testing scenario:
   // 1. Start the miner and a pruning digest node; let the digest node sync ({stoppedAt} full blocks);
