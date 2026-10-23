@@ -681,7 +681,11 @@ class ErgoWalletServiceImpl(override val ergoSettings: ErgoSettings) extends Erg
           case Some(address) =>
             prover.hdPubKeys.find(_.key.value == address.pubkey.value).map(_.key)
           case None =>
-            prover.hdPubKeys.headOption.map(_.key)
+            // the wallet's first address as /wallet/addresses lists it; the master key, first in the
+            // prover, is not listed when EIP-3 keys follow it
+            state.walletVars.publicKeyAddresses.headOption.flatMap { first =>
+              prover.hdPubKeys.find(_.key.value == first.pubkey.value).map(_.key)
+            }
         }
         pubKeyOpt match {
           case Some(pubKey) =>
