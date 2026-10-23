@@ -41,9 +41,12 @@ class PrunedDigestNodeCatchUpSpec
     .withFallback(nodeSeedConfigs.head)
     .withFallback(allowLocalConfig)
 
-  // pruning light (digest) node that syncs, goes offline, then has to catch up
+  // pruning light (digest) node that syncs, goes offline, then has to catch up; headers count as fresh for
+  // blockInterval * headerChainDiff = 500 ms * 8 = 4 s, so after the restart the headers chain is declared synced near
+  // the miner's tip, not at the first header after the best full block, and minimalFullBlockHeight jumps above it
   private val digestConfig: Config = digestStatePeerConfig
     .withFallback(prunedHistoryConfig(blocksToKeep))
+    .withFallback(headerChainDiffConfig(8))
     .withFallback(blockIntervalConfig(500))
     .withFallback(nonGeneratingPeerConfig)
     .withFallback(specialDataDirConfig(remoteVolume))
