@@ -2084,6 +2084,28 @@ components:
         proof:
           type: object
           $ref: '#/components/schemas/ProofOfUpcomingTransactions'
+        txStatus:
+          type: array
+          description: >-
+            Only from /mining/candidateWithTxs and /mining/candidateWithTxsAndPk when transactions were requested: one
+            entry per requested transaction, in request order. "proved": its membership proof is in `proof`.
+            "notProved": it was prioritized but is not in the candidate (for example invalid, or over a limit).
+            "refused": it was not prioritized, as its inputs are neither in the state nor among the requested
+            transactions' outputs; it can still enter the candidate from the mempool, then without a proof.
+          items:
+            type: object
+            required:
+              - id
+              - status
+            properties:
+              id:
+                $ref: '#/components/schemas/TransactionId'
+              status:
+                type: string
+                enum:
+                  - proved
+                  - notProved
+                  - refused
 
     Peer:
       type: object

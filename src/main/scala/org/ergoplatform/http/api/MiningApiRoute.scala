@@ -56,7 +56,7 @@ case class MiningApiRoute(miner: ActorRef,
     & post & entity(as[Seq[ErgoTransaction]]) & withAuth) { txs =>
 
     val prepareCmd = CandidateGenerator.GenerateCandidate(txs, reply = true, forced = false)
-    val candidateF = miner.askWithStatus(prepareCmd).mapTo[Candidate].map(_.externalVersion)
+    val candidateF = miner.askWithStatus(prepareCmd).mapTo[Candidate].map(withTxStatus(txs, _))
     ApiResponse(candidateF)
   }
 
@@ -69,8 +69,25 @@ case class MiningApiRoute(miner: ActorRef,
       case Success(pk) =>
         val prepareCmd = CandidateGenerator.GenerateCandidate(txsAndPk.txs, reply = true,
           forced = false, Some(ProveDlog.apply(pk)))
-        val candidateF = miner.askWithStatus(prepareCmd).mapTo[Candidate].map(_.externalVersion)
+        val candidateF = miner.askWithStatus(prepareCmd).mapTo[Candidate].map(withTxStatus(txsAndPk.txs, _))
         ApiResponse(candidateF)
+    }
+  }
+
+  /**
+    * The work message, plus `txStatus` when transactions were requested: one entry per requested id, in request
+    * order, saying whether its proof is in the message ("proved"), it was prioritized but is not in the candidate
+    * ("notProved"), or it was not prioritized, as its inputs are not in the state ("refused")
+    */
+  private def withTxStatus(requested: Seq[ErgoTransaction], candidate: Candidate): Json = {
+    val workMessage = candidate.externalVersion.asJson
+    if (requested.isEmpty) {
+      workMessage
+    } else {
+      val statuses = CandidateGenerator.requestedTxStatus(requested, candidate).map { case (id, status) =>
+        Json.obj("id" -> Json.fromString(id), "status" -> Json.fromString(status))
+      }
+      workMessage.deepMerge(Json.obj("txStatus" -> Json.fromValues(statuses)))
     }
   }
 

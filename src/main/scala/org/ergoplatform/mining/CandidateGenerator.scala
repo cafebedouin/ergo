@@ -323,6 +323,33 @@ object CandidateGenerator extends ScorexLogging {
     txsToInclude: Seq[ErgoTransaction]
   )
 
+  /** A requested transaction's membership proof is in the work message */
+  val TxProved = "proved"
+  /** A requested transaction was prioritized but has no proof, as it is not in the candidate (e.g. invalid or over a limit) */
+  val TxNotProved = "notProved"
+  /**
+    * A requested transaction was not prioritized, as its inputs are neither in the state nor among the requested
+    * transactions' outputs; it can still enter the candidate from the mempool, then without a proof
+    */
+  val TxRefused = "refused"
+
+  /**
+    * What became of each transaction requested for a candidate, in request order, so an external miner can tell a
+    * transaction left out from one that was never considered (an empty proof list reads the same for both).
+    * `candidate.txsToInclude` holds the requested transactions that were prioritized.
+    */
+  def requestedTxStatus(requested: Seq[ErgoTransaction], candidate: Candidate): Seq[(ModifierId, String)] = {
+    val provedIds = candidate.externalVersion.proofsForMandatoryTransactions.toSeq.flatMap(_.txProofs.map(_.txId)).toSet
+    val prioritizedIds = candidate.txsToInclude.map(_.id).toSet
+    requested.map { tx =>
+      val status =
+        if (provedIds.contains(tx.id)) TxProved
+        else if (prioritizedIds.contains(tx.id)) TxNotProved
+        else TxRefused
+      tx.id -> status
+    }
+  }
+
   case class GenerateCandidate(
     txsToInclude: Seq[ErgoTransaction],
     reply: Boolean,
@@ -550,6 +577,10 @@ object CandidateGenerator extends ScorexLogging {
         )
         None
       } else {
+        val refusedIds = txsToInclude.map(_.id).filterNot(unspentTxsToInclude.map(_.id).toSet)
+        if (refusedIds.nonEmpty) {
+          log.info(s"Requested transactions not prioritized, their inputs are not in the state: ${refusedIds.mkString(", ")}")
+        }
         Some(candidateAttempt)
       }
     }
