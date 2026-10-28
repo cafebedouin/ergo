@@ -35,7 +35,7 @@ import scorex.util.encode.Base16
 import sigma.data.ProveDlog
 import sigma.serialization.ErgoTreeSerializer
 import sigmastate.crypto.DLogProtocol.DLogProverInput
-import scorex.crypto.authds.{ADDigest, SerializedAdProof}
+import scorex.crypto.authds.{ADDigest, ADKey, SerializedAdProof}
 
 import scala.concurrent.duration._
 import scala.util.{Failure, Try}
@@ -1875,6 +1875,62 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     val restarted = CandidateGenerator(defaultMinerSecret.publicImage, readersHolderRef, viewHolderRef, settings)
     candidateFrom(restarted).candidateBlock.parentOpt.map(_.id) shouldBe Some(genesis.id)
     system.terminate()
+  }
+
+  it should "report each requested transaction as proved, not proved or refused" in new TestKit(ActorSystem()) {
+    val testProbe = new TestProbe(system)
+    system.eventStream.subscribe(testProbe.ref, newBlockSignal)
+
+    val settings: ErgoSettings =
+      defaultSettings.copy(directory = s"${defaultSettings.directory}-requested-status-${System.currentTimeMillis()}")
+    val viewHolderRef: ActorRef    = ErgoNodeViewRef(settings)
+    val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+    val candidateGenerator: ActorRef =
+      CandidateGenerator(defaultMinerSecret.publicImage, readersHolderRef, viewHolderRef, settings)
+
+    def candidateWith(txs: Seq[ErgoTransaction]): Candidate = {
+      candidateGenerator.tell(GenerateCandidate(txs, reply = true, forced = true), testProbe.ref)
+      testProbe.fishForSpecificMessage(newBlockDelay) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+    }
+
+    try {
+      // mine a block, so that its reward box can be spent
+      val first = settings.chainSettings.powScheme
+        .proveCandidate(candidateWith(Seq.empty).candidateBlock, defaultMinerSecret.w, 0, 1000).get
+      candidateGenerator.tell(first.header.powSolution, testProbe.ref)
+      testProbe.fishForMessage(newBlockDelay) { case FullBlockApplied(h) => h.id == first.id; case _ => false }
+      val readers: Readers = await((readersHolderRef ? GetReaders).mapTo[Readers])
+      val rewardBox: ErgoBox = readers.h.bestFullBlockOpt.get.transactions.last.outputs.last
+
+      def spend(boxes: IndexedSeq[ErgoBox], key: String): ErgoTransaction = {
+        val prop = DLogProverInput(BigIntegers.fromUnsignedByteArray(key.getBytes())).publicImage
+        val outputs = IndexedSeq(
+          new ErgoBoxCandidate(boxes.map(_.value).sum, ErgoTree.fromSigmaBoolean(prop), readers.s.stateContext.currentHeight))
+        val unsigned = new UnsignedErgoTransaction(boxes.map(b => Input(b.id, emptyProverResult)), IndexedSeq(), outputs)
+        ErgoTransaction(defaultProver.sign(unsigned, boxes, IndexedSeq(), readers.s.stateContext).get)
+      }
+
+      val proved = spend(IndexedSeq(rewardBox), "first")
+      // its input is not in the state, so the generator filters it out before assembly
+      val refused = ErgoTransaction(
+        IndexedSeq(Input(ADKey @@ Array.fill(32)(7: Byte), emptyProverResult)), IndexedSeq(), proved.outputCandidates)
+      // spends the same box as `proved`, so assembly drops it as a double spend
+      val notProved = spend(IndexedSeq(rewardBox), "second")
+
+      val requested = Seq(proved, refused, notProved)
+      val candidate = candidateWith(requested)
+      candidate.candidateBlock.transactions.map(_.id) should contain(proved.id)
+      candidate.candidateBlock.transactions.map(_.id) should not contain notProved.id
+      CandidateGenerator.requestedTxStatus(requested, candidate) shouldBe Seq(
+        proved.id -> CandidateGenerator.TxProved,
+        refused.id -> CandidateGenerator.TxRefused,
+        notProved.id -> CandidateGenerator.TxNotProved
+      )
+    } finally {
+      system.terminate()
+    }
   }
 
 }
