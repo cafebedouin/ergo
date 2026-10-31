@@ -55,15 +55,6 @@ trait ApiCodecs extends JsonCodecs {
       }
     }
 
-  override implicit val adKeyDecoder: Decoder[ADKey] =
-    fixedSizeBytesDecoder("ADKey", Constants.ModifierIdSize)(ADKey @@ _)
-
-  override implicit val adDigestDecoder: Decoder[ADDigest] =
-    fixedSizeBytesDecoder("ADDigest", Constants.ModifierIdSize + 1)(ADDigest @@ _)
-
-  override implicit val digest32Decoder: Decoder[Digest32] =
-    fixedSizeBytesDecoder("Digest32", Constants.ModifierIdSize)(Digest32 @@ _)
-
   def fromValidation[T](validationResult: ValidationResult[T])
                        (implicit cursor: ACursor): Either[DecodingFailure, T] = {
     fromTry(validationResult.toTry)
