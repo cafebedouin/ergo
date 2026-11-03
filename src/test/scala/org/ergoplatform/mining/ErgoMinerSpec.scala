@@ -19,7 +19,7 @@ import org.ergoplatform.nodeView.state._
 import org.ergoplatform.nodeView.wallet._
 import org.ergoplatform.nodeView.{ErgoNodeViewRef, ErgoReadersHolderRef}
 import org.ergoplatform.settings.{ErgoSettings, ErgoSettingsReader, NetworkType}
-import org.ergoplatform.utils.ErgoTestHelpers
+import org.ergoplatform.utils.{ErgoTestHelpers, TestActorSystems}
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
 import org.ergoplatform.{ErgoBox, ErgoBoxCandidate, ErgoTreePredef, Input, InputBlockFound, InputSolutionFound, OrderingBlockFound, OrderingSolutionFound, SolutionFound}
 import org.scalatest.concurrent.Eventually
@@ -33,7 +33,7 @@ import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration._
 import scala.language.postfixOps
 
-class ErgoMinerSpec extends AnyFlatSpec with ErgoTestHelpers with Eventually {
+class ErgoMinerSpec extends AnyFlatSpec with ErgoTestHelpers with Eventually with TestActorSystems {
   import org.ergoplatform.utils.ErgoNodeTestConstants._
   import org.ergoplatform.utils.ErgoCoreTestConstants._
   import org.ergoplatform.utils.generators.ValidBlocksGenerators._
@@ -319,7 +319,7 @@ class ErgoMinerSpec extends AnyFlatSpec with ErgoTestHelpers with Eventually {
     system.terminate()
   }
 
-  it should "prepare external candidate" in new TestKit(ActorSystem()) {
+  it should "prepare external candidate" in new TestKit(testSystem()) {
     val ergoSettings: ErgoSettings = defaultSettings.copy(directory = createTempDir.getAbsolutePath)
 
     val nodeViewHolderRef: ActorRef = ErgoNodeViewRef(ergoSettings)
@@ -412,7 +412,7 @@ class ErgoMinerSpec extends AnyFlatSpec with ErgoTestHelpers with Eventually {
     }
   }
 
-  it should "pass external ordering and input-block solutions to the candidate generator" in new TestKit(ActorSystem()) {
+  it should "pass external ordering and input-block solutions to the candidate generator" in new TestKit(testSystem()) {
     val testProbe = new TestProbe(system)
     system.eventStream.subscribe(testProbe.ref, newBlockSignal)
     val ergoSettings: ErgoSettings = {

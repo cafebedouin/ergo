@@ -22,7 +22,7 @@ import org.ergoplatform.nodeView.wallet.ErgoWalletReader
 import org.ergoplatform.nodeView.{ErgoNodeViewRef, ErgoReadersHolderRef, LocallyGeneratedOrderingBlock}
 import org.ergoplatform.settings.NetworkType.DevNet60
 import org.ergoplatform.settings.{ErgoSettings, ErgoSettingsReader}
-import org.ergoplatform.utils.ErgoTestHelpers
+import org.ergoplatform.utils.{ErgoTestHelpers, TestActorSystems}
 import org.ergoplatform.utils.generators.ValidBlocksGenerators.{createUtxoState, validFullBlock, validTransactionsFromBoxHolder}
 import org.ergoplatform.utils.generators.ChainGenerator.{applyChain, genHeaderChain}
 import org.ergoplatform.utils.{HistoryTestHelpers, RandomWrapper}
@@ -41,7 +41,7 @@ import scorex.crypto.authds.{ADDigest, SerializedAdProof}
 import scala.concurrent.duration._
 import scala.util.{Failure, Try}
 
-class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelpers with Eventually {
+class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelpers with Eventually with TestActorSystems {
   import org.ergoplatform.utils.ErgoNodeTestConstants._
   import org.ergoplatform.utils.ErgoCoreTestConstants._
 
@@ -97,7 +97,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
   private val defaultSettings60 = defaultSettings.copy(networkType = DevNet60, directory = defaultSettings.directory + "60")
 
   it should "provider candidate to internal miner and verify and apply his solution" in new TestKit(
-    ActorSystem()
+    testSystem()
   ) {
     val testProbe = new TestProbe(system)
     system.eventStream.subscribe(testProbe.ref, newBlockSignal)
@@ -121,7 +121,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
   }
 
   it should "recover when locally mined block is invalidated by node view holder" in new TestKit(
-    ActorSystem()
+    testSystem()
   ) {
     val replyProbe = new TestProbe(system)
     // fake node view holder: solved block is never applied, so solvedBlock stays set
@@ -192,7 +192,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
   }
 
   it should "recover when locally mined block is invalidated by full block id" in new TestKit(
-    ActorSystem()
+    testSystem()
   ) {
     val replyProbe = new TestProbe(system)
     // fake node view holder: solved block is never applied, so solvedBlock stays set
@@ -696,7 +696,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     system.terminate()
   }
 
-  it should "use custom miner public key when provided via optPk" in new TestKit(ActorSystem()) {
+  it should "use custom miner public key when provided via optPk" in new TestKit(testSystem()) {
     import sigmastate.crypto.DLogProtocol.DLogProverInput
     import org.bouncycastle.util.BigIntegers
 
@@ -736,7 +736,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     system.terminate()
   }
 
-  it should "use default minerPk when optPk is None" in new TestKit(ActorSystem()) {
+  it should "use default minerPk when optPk is None" in new TestKit(testSystem()) {
     val testProbe = new TestProbe(system)
     system.eventStream.subscribe(testProbe.ref, newBlockSignal)
 
@@ -768,7 +768,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     system.terminate()
   }
 
-  it should "generate different candidates for different optPk values" in new TestKit(ActorSystem()) {
+  it should "generate different candidates for different optPk values" in new TestKit(testSystem()) {
     import sigmastate.crypto.DLogProtocol.DLogProverInput
     import org.bouncycastle.util.BigIntegers
 
@@ -818,7 +818,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     system.terminate()
   }
 
-  it should "handle optPk with empty transactions" in new TestKit(ActorSystem()) {
+  it should "handle optPk with empty transactions" in new TestKit(testSystem()) {
     import sigmastate.crypto.DLogProtocol.DLogProverInput
     import org.bouncycastle.util.BigIntegers
 
@@ -857,7 +857,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     system.terminate()
   }
 
-  it should "ignore cached candidate when forced = true" in new TestKit(ActorSystem()) {
+  it should "ignore cached candidate when forced = true" in new TestKit(testSystem()) {
     val testProbe = new TestProbe(system)
     system.eventStream.subscribe(testProbe.ref, newBlockSignal)
 
@@ -1120,7 +1120,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     system.terminate()
   }
 
-  it should "return cached candidate immediately when forced = false" in new TestKit(ActorSystem()) {
+  it should "return cached candidate immediately when forced = false" in new TestKit(testSystem()) {
     val testProbe = new TestProbe(system)
     system.eventStream.subscribe(testProbe.ref, newBlockSignal)
 
@@ -1268,7 +1268,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
   }
 
   it should "correctly complete input block from candidate and solution" in new TestKit(
-    ActorSystem()
+    testSystem()
   ) {
     val viewHolderRef: ActorRef    = ErgoNodeViewRef(defaultSettings)
     val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
@@ -1365,7 +1365,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
   }
 
   it should "exclude applied transactions from stale mempool and not eliminate them" in new TestKit(
-    ActorSystem()
+    testSystem()
   ) {
 
     val testDir = s"${defaultSettings.directory}-a1-stale-${System.currentTimeMillis()}"
@@ -1437,7 +1437,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
   }
 
   it should "discard candidate when history and state are out of sync" in new TestKit(
-    ActorSystem()
+    testSystem()
   ) {
 
     val testDir = s"${defaultSettings.directory}-b1-sync-${System.currentTimeMillis()}"
@@ -1570,7 +1570,7 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
   }
 
   it should "fall back to emission-only candidate when proof generation keeps failing" in new TestKit(
-    ActorSystem()
+    testSystem()
   ) {
     val testDir = s"${defaultSettings.directory}-proof-fallback-${System.currentTimeMillis()}"
     val settings = testSettings(testDir)
