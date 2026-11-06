@@ -406,6 +406,246 @@ class ErgoNodeViewSynchronizerSpecification extends AnyPropSpec
     }
   }
 
+  // A block section is requested from one connection. A reply for it from a different connection whose bytes do not
+  // parse to the requested id must not change that request: the owner keeps its request attempt and its timer, the
+  // owner is not penalized, and the section is not re-requested. The oracle is the delivery tracker's own entry (the
+  // same RequestedInfo object, its handler, a timer the test owns) and the messages sent to the network controller.
+
+  private final class ObservedTimer extends Cancellable {
+    private val cancelled = new java.util.concurrent.atomic.AtomicBoolean(false)
+    override def cancel(): Boolean = cancelled.compareAndSet(false, true)
+    override def isCancelled: Boolean = cancelled.get()
+  }
+
+  private case class RequestObservation(status: scorex.core.network.ModifiersStatus,
+                                        sameRequestAttempt: Boolean,
+                                        requestHandler: Option[ActorRef],
+                                        timerCancelled: Boolean,
+                                        penaltiesToOwner: Seq[PenaltyType],
+                                        penaltiesToOther: Seq[PenaltyType],
+                                        reRequests: Int)
+
+  private def otherConnection(owner: ConnectedPeer, handler: ActorRef): ConnectedPeer = {
+    val other = owner.copy(
+      connectionId = owner.connectionId.copy(remoteAddress = new InetSocketAddress("203.0.113.2", 9030)),
+      handlerRef = handler
+    )
+    other.connectionId.remoteAddress should not be owner.connectionId.remoteAddress
+    other.handlerRef should not be owner.handlerRef
+    other
+  }
+
+  private def observeRequest(ncProbe: TestProbe,
+                             deliveryTracker: DeliveryTracker,
+                             typeId: NetworkObjectTypeId.Value,
+                             id: ModifierId,
+                             attempt: DeliveryTracker.RequestedInfo,
+                             timerCancelled: => Boolean,
+                             owner: ConnectedPeer,
+                             other: ConnectedPeer): RequestObservation = {
+    val sent = ncProbe.receiveWhile(max = 5.seconds, idle = 1.second) { case m => m }
+    def penaltiesTo(p: ConnectedPeer): Seq[PenaltyType] =
+      sent.collect { case PenalizePeer(address, penalty) if address == p.connectionId.remoteAddress => penalty }
+    val reRequests = sent.count {
+      case stn: SendToNetwork if stn.message.spec.messageCode == RequestModifierSpec.messageCode =>
+        val data = stn.message.data.get.asInstanceOf[InvData]
+        data.typeId == typeId && data.ids.contains(id)
+      case _ => false
+    }
+    val current = deliveryTracker.getRequestedInfo(typeId, id)
+    RequestObservation(
+      deliveryTracker.status(id, typeId, Seq.empty),
+      current.exists(_ eq attempt),
+      current.map(_.peer.handlerRef),
+      timerCancelled,
+      penaltiesTo(owner),
+      penaltiesTo(other),
+      reRequests
+    )
+  }
+
+  property("NodeViewSynchronizer: request owner: another connection's non-matching section reply leaves the request") {
+    withFixture { ctx =>
+      import ctx._
+      import org.ergoplatform.modifiers.history.ADProofsSerializer
+
+      deliveryTracker.reset()
+      val typeId = ADProofs.modifierTypeId
+      val requested = ADProofs(chain.head.id, SerializedAdProof @@ Array.fill(64)(1: Byte))
+      val sibling = ADProofs(chain.head.id, SerializedAdProof @@ Array.fill(64)(2: Byte))
+      // a well-formed section of the same type whose bytes do not bind to the requested id
+      ADProofsSerializer.parseBytes(sibling.bytes).id should not be requested.id
+
+      val other = otherConnection(peer, TestProbe("OtherPeerHandler").ref)
+      val timer = new ObservedTimer
+      deliveryTracker.setRequested(typeId, requested.id, peer)(_ => timer)
+      val attempt = deliveryTracker.getRequestedInfo(typeId, requested.id).get
+      ncProbe.receiveWhile(max = 2.seconds, idle = 300.millis) { case m => m }
+
+      val reply = ModifiersData(typeId, Map(requested.id -> sibling.bytes))
+      synchronizer ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(reply)), Some(other))
+
+      observeRequest(ncProbe, deliveryTracker, typeId, requested.id, attempt, timer.isCancelled, peer, other) shouldBe
+        RequestObservation(Requested, sameRequestAttempt = true, Some(peer.handlerRef), timerCancelled = false,
+          penaltiesToOwner = Seq.empty, penaltiesToOther = Seq(PenaltyType.MisbehaviorPenalty), reRequests = 0)
+    }
+  }
+
+  property("NodeViewSynchronizer: request owner: another connection's undecodable header reply leaves the request") {
+    withFixture { ctx =>
+      import ctx._
+
+      deliveryTracker.reset()
+      val typeId = Header.modifierTypeId
+      val header = chain.take(1001).last
+      val other = otherConnection(peer, TestProbe("OtherPeerHandler").ref)
+
+      // the node itself requests the header from the announcing connection
+      synchronizer ! Message(InvSpec, Left(InvSpec.toBytes(InvData(typeId, Seq(header.id)))), Some(peer))
+      requestForModifierSent(ncProbe, typeId, header.id)
+      eventually {
+        deliveryTracker.getRequestedInfo(typeId, header.id).map(_.peer.handlerRef) shouldBe Some(peer.handlerRef)
+      }
+      val attempt = deliveryTracker.getRequestedInfo(typeId, header.id).get
+      ncProbe.receiveWhile(max = 2.seconds, idle = 300.millis) { case m => m }
+
+      val undecodable = ModifiersData(typeId, Map(header.id -> Array[Byte](0)))
+      synchronizer ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(undecodable)), Some(other))
+      val afterOther =
+        observeRequest(ncProbe, deliveryTracker, typeId, header.id, attempt, attempt.cancellable.isCancelled, peer, other)
+
+      // the owner then answers its request with the valid header
+      synchronizer ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(ModifiersData(typeId, Map(header.id -> header.bytes)))), Some(peer))
+      val afterOwner = ncProbe.receiveWhile(max = 5.seconds, idle = 1.second) { case m => m }
+      val ownerPenalties = afterOwner.collect {
+        case PenalizePeer(address, penalty) if address == peer.connectionId.remoteAddress => penalty
+      }
+      val ownerReply = (deliveryTracker.status(header.id, typeId, Seq.empty), ownerPenalties)
+
+      (afterOther, ownerReply) shouldBe ((
+        RequestObservation(Requested, sameRequestAttempt = true, Some(peer.handlerRef), timerCancelled = false,
+          penaltiesToOwner = Seq.empty, penaltiesToOther = Seq(PenaltyType.MisbehaviorPenalty), reRequests = 0),
+        (Received, Seq.empty)
+      ))
+    }
+  }
+
+  property("NodeViewSynchronizer: request owner: the owner's own non-matching section reply clears its request") {
+    withFixture { ctx =>
+      import ctx._
+      import org.ergoplatform.modifiers.history.ADProofsSerializer
+
+      deliveryTracker.reset()
+      val typeId = ADProofs.modifierTypeId
+      val requested = ADProofs(chain.head.id, SerializedAdProof @@ Array.fill(64)(1: Byte))
+      val sibling = ADProofs(chain.head.id, SerializedAdProof @@ Array.fill(64)(2: Byte))
+      ADProofsSerializer.parseBytes(sibling.bytes).id should not be requested.id
+
+      val other = otherConnection(peer, TestProbe("OtherPeerHandler").ref)
+      val timer = new ObservedTimer
+      deliveryTracker.setRequested(typeId, requested.id, peer)(_ => timer)
+      val attempt = deliveryTracker.getRequestedInfo(typeId, requested.id).get
+      ncProbe.receiveWhile(max = 2.seconds, idle = 300.millis) { case m => m }
+
+      val reply = ModifiersData(typeId, Map(requested.id -> sibling.bytes))
+      synchronizer ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(reply)), Some(peer))
+
+      observeRequest(ncProbe, deliveryTracker, typeId, requested.id, attempt, timer.isCancelled, peer, other) shouldBe
+        RequestObservation(Unknown, sameRequestAttempt = false, None, timerCancelled = true,
+          penaltiesToOwner = Seq(PenaltyType.MisbehaviorPenalty), penaltiesToOther = Seq.empty, reRequests = 0)
+    }
+  }
+
+  property("NodeViewSynchronizer: request owner: a same-address replacement handler's non-matching reply leaves the request") {
+    withFixture { ctx =>
+      import ctx._
+      import org.ergoplatform.modifiers.history.ADProofsSerializer
+
+      deliveryTracker.reset()
+      val typeId = ADProofs.modifierTypeId
+      val requested = ADProofs(chain.head.id, SerializedAdProof @@ Array.fill(64)(1: Byte))
+      val sibling = ADProofs(chain.head.id, SerializedAdProof @@ Array.fill(64)(2: Byte))
+      ADProofsSerializer.parseBytes(sibling.bytes).id should not be requested.id
+
+      // same remote IP and port (ConnectedPeer equality is address-only), a different connection handler
+      val other = peer.copy(handlerRef = TestProbe("SameAddressHandler").ref)
+      other shouldBe peer
+      other.handlerRef should not be peer.handlerRef
+      val timer = new ObservedTimer
+      deliveryTracker.setRequested(typeId, requested.id, peer)(_ => timer)
+      val attempt = deliveryTracker.getRequestedInfo(typeId, requested.id).get
+      ncProbe.receiveWhile(max = 2.seconds, idle = 300.millis) { case m => m }
+
+      val reply = ModifiersData(typeId, Map(requested.id -> sibling.bytes))
+      synchronizer ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(reply)), Some(other))
+
+      // penalties are keyed by remote address, so the owner's and the other handler's lists are the same list here
+      observeRequest(ncProbe, deliveryTracker, typeId, requested.id, attempt, timer.isCancelled, peer, other) shouldBe
+        RequestObservation(Requested, sameRequestAttempt = true, Some(peer.handlerRef), timerCancelled = false,
+          penaltiesToOwner = Seq(PenaltyType.MisbehaviorPenalty), penaltiesToOther = Seq(PenaltyType.MisbehaviorPenalty),
+          reRequests = 0)
+    }
+  }
+
+  property("NodeViewSynchronizer: request owner: a valid reply from a new handler at the requested address is accepted") {
+    withFixture { ctx =>
+      import ctx._
+
+      deliveryTracker.reset()
+      val typeId = Header.modifierTypeId
+      val header = chain.take(1001).last
+      // the request was recorded for the old handler; the peer reconnected and its new handler answers
+      val newHandler = TestProbe("ReconnectedHandler").ref
+      val reconnected = peer.copy(handlerRef = newHandler)
+      val timer = new ObservedTimer
+      deliveryTracker.setRequested(typeId, header.id, peer)(_ => timer)
+      val attempt = deliveryTracker.getRequestedInfo(typeId, header.id).get
+      ncProbe.receiveWhile(max = 2.seconds, idle = 300.millis) { case m => m }
+
+      synchronizer ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(ModifiersData(typeId, Map(header.id -> header.bytes)))), Some(reconnected))
+      val observed =
+        observeRequest(ncProbe, deliveryTracker, typeId, header.id, attempt, timer.isCancelled, peer, reconnected)
+      val source = deliveryTracker.getSource(header.id, typeId).map(_.handlerRef)
+
+      (observed, source) shouldBe ((
+        RequestObservation(Received, sameRequestAttempt = false, None, timerCancelled = true,
+          penaltiesToOwner = Seq.empty, penaltiesToOther = Seq.empty, reRequests = 0),
+        Some(newHandler)
+      ))
+    }
+  }
+
+  property("NodeViewSynchronizer: request owner: an old handler's late non-matching reply leaves its replacement's request") {
+    withFixture { ctx =>
+      import ctx._
+      import org.ergoplatform.modifiers.history.ADProofsSerializer
+
+      deliveryTracker.reset()
+      val typeId = ADProofs.modifierTypeId
+      val requested = ADProofs(chain.head.id, SerializedAdProof @@ Array.fill(64)(1: Byte))
+      val sibling = ADProofs(chain.head.id, SerializedAdProof @@ Array.fill(64)(2: Byte))
+      ADProofsSerializer.parseBytes(sibling.bytes).id should not be requested.id
+
+      // the peer reconnected: the request belongs to the replacement handler at the same address, and the old
+      // handler's reply arrives late
+      val replacement = peer.copy(handlerRef = TestProbe("ReplacementHandler").ref)
+      replacement shouldBe peer
+      replacement.handlerRef should not be peer.handlerRef
+      val timer = new ObservedTimer
+      deliveryTracker.setRequested(typeId, requested.id, replacement)(_ => timer)
+      val attempt = deliveryTracker.getRequestedInfo(typeId, requested.id).get
+      ncProbe.receiveWhile(max = 2.seconds, idle = 300.millis) { case m => m }
+
+      val reply = ModifiersData(typeId, Map(requested.id -> sibling.bytes))
+      synchronizer ! Message(ModifiersSpec, Left(ModifiersSpec.toBytes(reply)), Some(peer))
+
+      observeRequest(ncProbe, deliveryTracker, typeId, requested.id, attempt, timer.isCancelled, replacement, peer) shouldBe
+        RequestObservation(Requested, sameRequestAttempt = true, Some(replacement.handlerRef), timerCancelled = false,
+          penaltiesToOwner = Seq(PenaltyType.MisbehaviorPenalty), penaltiesToOther = Seq(PenaltyType.MisbehaviorPenalty),
+          reRequests = 0)
+    }
+  }
+
   property("NodeViewSynchronizer: empty Modifiers reply is not delivery progress, requested section still counts as not delivered") {
     withFixture { ctx =>
       import ctx._
