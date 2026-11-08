@@ -10,6 +10,7 @@ import org.ergoplatform.mining.AutolykosPowScheme
 import org.ergoplatform.modifiers.history._
 import org.ergoplatform.modifiers.history.header.{Header, PreGenesisHeader}
 import org.ergoplatform.modifiers.{BlockSection, ErgoFullBlock, ErgoNodeViewModifier, NonHeaderBlockSection}
+import org.ergoplatform.nodeView.history.UtxoSetScanner.InitializeUtxoSetScannerWithHistory
 import org.ergoplatform.nodeView.history.extra.ExtraIndexer.{GlobalBoxIndexKey, GlobalTxIndexKey, IndexedHeaderIdKey,
   IndexedHeightKey, NewestVersion, NewestVersionBytes, RentIndexEnabledBytes, RentIndexEnabledKey, RollbackToKey, SchemaVersionKey}
 import org.ergoplatform.nodeView.history.extra.{IndexedErgoBox, IndexedErgoTransaction, NumericBoxIndex, NumericTxIndex}
@@ -21,7 +22,6 @@ import org.ergoplatform.validation.RecoverableModifierError
 import scorex.db.ByteArrayWrapper
 import scorex.util.{ModifierId, ScorexLogging, bytesToId, idToBytes}
 
-import scala.annotation.nowarn
 import scala.util.{Failure, Success, Try}
 
 /**
@@ -266,7 +266,6 @@ object ErgoHistory extends ScorexLogging {
   /**
     * @return ErgoHistory instance with new database or database read from existing folder
     */
-  @nowarn("cat=unused")
   def readOrGenerate(ergoSettings: ErgoSettings)(implicit context: ActorContext): ErgoHistory = {
     var db = HistoryStorage(ergoSettings)
 
@@ -489,6 +488,12 @@ object ErgoHistory extends ScorexLogging {
     }
 
     log.info("History database read")
+
+    // set history for utxo set scanner, if bootstrapping by snapshot
+    if (ergoSettings.nodeSettings.utxoSettings.utxoBootstrap) {
+      context.system.eventStream.publish(InitializeUtxoSetScannerWithHistory(history))
+    }
+
     history
   }
 

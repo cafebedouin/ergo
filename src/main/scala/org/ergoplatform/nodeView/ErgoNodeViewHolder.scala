@@ -27,9 +27,13 @@ import spire.syntax.all.cfor
 
 import java.io.File
 import org.ergoplatform.modifiers.history.extension.Extension
+import org.ergoplatform.nodeView.history.UtxoSetScanner.StartUtxoSetScan
 
 import scala.annotation.tailrec
 import scala.collection.mutable
+import scala.concurrent.Await
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration.{Duration, SECONDS}
 import scala.util.{Failure, Success, Try}
 
 /**
@@ -478,6 +482,21 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     }
   }
 
+  /**
+    * Whether to send blocks to wallet to scan. (Utxo scan keeps wallet height at 0 while in progress)
+    * @return true if utxoBootstrap is not enabled; if it is enabled, then walletHeight > 0
+    */
+  private def shouldScanBlocks: Boolean =
+    if (settings.nodeSettings.utxoSettings.utxoBootstrap) {
+      try {
+        Await.result(vault().getWalletStatus.map(_.height), Duration(3, SECONDS)) > 0
+      } catch {
+        case _: Throwable => false
+      }
+    } else {
+      true
+    }
+
   //todo: update state in async way?
 
   /**
@@ -536,7 +555,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
                     v
                   }
 
-                  if (almostSynced) {
+                  if (almostSynced && shouldScanBlocks) {
                     blocksApplied.foreach(newVault.scanPersistent)
                   }
 
@@ -547,6 +566,9 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
                     case utxoStateReader: UtxoStateReader if headersHeight == fullBlockHeight =>
                       val recheckCommand = RecheckMempool(utxoStateReader, newMemPool)
                       context.system.eventStream.publish(recheckCommand)
+                      if (!shouldScanBlocks) {
+                        context.system.eventStream.publish(StartUtxoSetScan(false))
+                      }
                     case _ =>
                   }
 
