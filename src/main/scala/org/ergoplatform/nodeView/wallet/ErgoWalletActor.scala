@@ -234,20 +234,25 @@ class ErgoWalletActor(settings: ErgoSettings,
       context.become(loadedWallet(newState))
 
     case ScanBoxesFromUtxoSnapshot(subtrees, current, total, fullHeight) =>
-      val newState = subtrees.zipWithIndex.foldLeft(state) { case (accState, ((id, boxes), i)) =>
-        val chunk = current - subtrees.size + i + 1
-        val chunkHeight = if (chunk == total) fullHeight else 0
-        ergoWalletService.scanSnapshotChunk(accState, boxes, id, settings.walletSettings.dustLimit, chunkHeight) match {
-          case Failure(ex) =>
-            val errorMsg = s"Failed to scan ${boxes.length} boxes in chunk $chunk / $total: ${ex.getMessage}"
-            accState.copy(error = Some(errorMsg))
-          case Success(updatedState) =>
-            log.info(s"Successfully scanned ${boxes.length} boxes in chunk $chunk / $total")
-            updatedState
-        }
+      val firstChunk = current - subtrees.size + 1
+      // stop at the first failed chunk and reply with the last chunk scanned, so the scanner records progress only that far
+      val (newState, lastScanned) = subtrees.zipWithIndex.foldLeft((state, firstChunk - 1)) {
+        case ((accState, scanned), ((id, boxes), i)) if scanned == firstChunk + i - 1 =>
+          val chunk = firstChunk + i
+          val chunkHeight = if (chunk == total) fullHeight else 0
+          ergoWalletService.scanSnapshotChunk(accState, boxes, id, settings.walletSettings.dustLimit, chunkHeight) match {
+            case Failure(ex) =>
+              val errorMsg = s"Failed to scan ${boxes.length} boxes in chunk $chunk / $total: ${ex.getMessage}"
+              log.error(errorMsg)
+              (accState.copy(error = Some(errorMsg)), scanned)
+            case Success(updatedState) =>
+              log.info(s"Successfully scanned ${boxes.length} boxes in chunk $chunk / $total")
+              (updatedState, chunk)
+          }
+        case (acc, _) => acc // an earlier chunk of this batch failed
       }
       context.become(loadedWallet(newState))
-      sender() ! "ok"
+      sender() ! lastScanned
 
     // rescan=true means we serve a user request for rescan from arbitrary height
     case ScanInThePast(blockHeight, rescan) =>

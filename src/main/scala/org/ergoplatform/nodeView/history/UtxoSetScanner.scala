@@ -98,11 +98,16 @@ class UtxoSetScanner(nodeView: ActorRef, depth: Int = MainnetManifestDepth) exte
     * @param wallet     - wallet handle
     * @param current    - current subtree count after this batch
     * @param scanHeight - height of the UTXO state being scanned
+    * @param offset     - how far `current` was moved past the subtrees actually visited (shallow tree), 0 otherwise
+    * @return whether the wallet scanned the whole batch
     */
-  private def sendBufferToWallet(wallet: ErgoWallet, current: Int, scanHeight: Int): Unit = {
-    wallet.scanUtxoSnapshot(ScanBoxesFromUtxoSnapshot(chunkBuffer.toVector, current, totalSubtrees, scanHeight))
-    writeProgress(current, totalSubtrees)
+  private def sendBufferToWallet(wallet: ErgoWallet, current: Int, scanHeight: Int, offset: Int = 0): Boolean = {
+    val scanned = wallet.scanUtxoSnapshot(ScanBoxesFromUtxoSnapshot(chunkBuffer.toVector, current, totalSubtrees, scanHeight))
+    val complete = scanned == current
+    // on a failure, record the real position in the tree, so the next scan resumes at the failed subtree
+    writeProgress(if (complete) current else scanned - offset, totalSubtrees)
     chunkBuffer.clear()
+    complete
   }
 
   private def run(): Unit = {
@@ -126,27 +131,39 @@ class UtxoSetScanner(nodeView: ActorRef, depth: Int = MainnetManifestDepth) exte
     val scanHeight = state.stateContext.currentHeight
     log.info(s"Starting UTXO set snapshot scan for $total chunks at height $scanHeight")
 
+    var failed = false
     state.persistentProver.storage.asInstanceOf[VersionedLDBAVLStorage].iterateAVLTree(current, depth) { subtree =>
-      current += 1
+      if (!failed) {
+        current += 1
 
-      chunkBuffer += ((
-        bytesToId(subtree.id),
-        subtree.leafValues.par.flatMap(ErgoBoxSerializer.parseBytesTry(_).toOption).toArray
-      ))
+        chunkBuffer += ((
+          bytesToId(subtree.id),
+          subtree.leafValues.par.flatMap(ErgoBoxSerializer.parseBytesTry(_).toOption).toArray
+        ))
 
-      if (chunkBuffer.size == 32) {
-        sendBufferToWallet(wallet, current, scanHeight)
+        if (chunkBuffer.size == 32) {
+          failed = !sendBufferToWallet(wallet, current, scanHeight)
+        }
       }
     }
 
+    if (failed) {
+      log.error("Wallet failed to scan a UTXO set subtree; the scan resumes from it on the next scan request")
+      return
+    }
+
     // If the AVL+ tree had leaves above `depth` (fewer than 2^depth subtrees), all leaves have now been visited
+    val offset = total - current
     if (current < total) {
       current = total
     }
 
     // flush remaining data, if any
     if (chunkBuffer.nonEmpty) {
-      sendBufferToWallet(wallet, current, scanHeight)
+      if (!sendBufferToWallet(wallet, current, scanHeight, offset)) {
+        log.error("Wallet failed to scan a UTXO set subtree; the scan resumes from it on the next scan request")
+        return
+      }
     } else if (readProgress()._1 < total) {
       writeProgress(total, total)
     }

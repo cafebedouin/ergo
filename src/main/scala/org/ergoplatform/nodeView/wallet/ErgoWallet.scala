@@ -46,12 +46,10 @@ class ErgoWallet(historyReader: ErgoHistoryReader, settings: ErgoSettings, param
     * Synchronously forwards a batch of UTXO snapshot subtrees to the wallet actor for scanning.
     *
     * @param msg - batch of subtrees and progress metadata
-    * @return this wallet instance
+    * @return number of the last subtree the wallet scanned (less than `msg.current` if a subtree failed)
     */
-  def scanUtxoSnapshot(msg: ScanBoxesFromUtxoSnapshot): ErgoWallet = {
-    Await.result(walletActor ? msg, duration)
-    this
-  }
+  def scanUtxoSnapshot(msg: ScanBoxesFromUtxoSnapshot): Int =
+    Await.result((walletActor ? msg).mapTo[Int], duration)
 
   def scanOffchain(tx: ErgoTransaction): ErgoWallet = {
     walletActor ! ScanOffChain(tx)
