@@ -124,7 +124,6 @@ class ErgoWalletServiceSpec
           initialState(store, versionedStore, Some(new FakeMempool(Seq(UnconfirmedTransaction(creatingTx, None)))))
         withCreated.offChainBoxes.map(_.box.value).sum shouldBe value
         withCreated.offChainDigest.walletBalance shouldBe value
-        withCreated.readBoxFromUtxoWithWalletFallback(creatingTx.outputs.head.id) shouldBe Some(creatingTx.outputs.head)
 
         // a second mempool transaction spending that off-chain box (chained tx) must remove it
         val spendingTx = new ErgoTransaction(

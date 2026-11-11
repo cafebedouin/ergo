@@ -172,9 +172,7 @@ case class ErgoWalletState(
       case Some(utxoReader) =>
         utxoReader.boxById(boxId)
       case None =>
-        registry.getBox(boxId)
-          .orElse(rawOffChainBoxes.find(_.box.id.sameElements(boxId)))
-          .map(_.box)
+        registry.getBox(boxId).map(_.box)
     }
   }
 
