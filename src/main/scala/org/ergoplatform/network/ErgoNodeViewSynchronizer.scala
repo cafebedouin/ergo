@@ -410,22 +410,37 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     */
   protected def sendSync(history: ErgoHistory): Unit = {
     if (history.bestHeaderOpt.isEmpty && settings.nodeSettings.nipopowSettings.nipopowBootstrap) {
-      // if no any header applied yet, and boostrapping via nipopows is ordered,
-      // ask for nipopow proofs instead of sending sync signal
-      requireNipopowProof(history)
+      // no header applied yet and NiPoPoW bootstrap is ordered: ask for proofs. Fallback: also send an
+      // ordinary sync signal once every known peer has been asked without progress, or after a few rounds, so
+      // the node is not stuck at height 0 when no acceptable proof arrives - it bootstraps the slower
+      // (header-sync) way instead. The signal is additive: a valid proof that still arrives is applied as before.
+      val askedSomeone = requireNipopowProof(history)
+      bootstrapRounds += 1
+      // asked some peer on an earlier round but none left to ask now => the known providers are exhausted
+      val providersExhausted = !askedSomeone && bootstrapRounds > 1
+      if (providersExhausted || bootstrapRounds > ErgoNodeViewSynchronizer.NipopowBootstrapFallbackRounds) {
+        log.info(s"NiPoPoW bootstrap made no progress (round $bootstrapRounds); falling back to header sync")
+        sendOrdinarySync(history)
+      }
     } else {
-      val peers = syncTracker.peersToSyncWith()
-      val (peersV2, peersV1) = peers.partition(p => syncV2Supported(p))
-      log.debug(s"Syncing with ${peersV1.size} peers via sync v1, ${peersV2.size} peers via sync v2")
-      if (peersV1.nonEmpty) {
-        val msg = Message(syncInfoSpec, Right(getV1SyncInfo(history)), None)
-        networkControllerRef ! SendToNetwork(msg, SendToPeers(peersV1))
-      }
-      if (peersV2.nonEmpty) {
-        //todo: send only last header to peers which are equal or younger
-        val v2SyncInfo = getV2SyncInfo(history, full = true)
-        networkControllerRef ! SendToNetwork(Message(syncInfoSpec, Right(v2SyncInfo), None), SendToPeers(peersV2))
-      }
+      sendOrdinarySync(history)
+    }
+  }
+
+  private var bootstrapRounds: Int = 0
+
+  private def sendOrdinarySync(history: ErgoHistory): Unit = {
+    val peers = syncTracker.peersToSyncWith()
+    val (peersV2, peersV1) = peers.partition(p => syncV2Supported(p))
+    log.debug(s"Syncing with ${peersV1.size} peers via sync v1, ${peersV2.size} peers via sync v2")
+    if (peersV1.nonEmpty) {
+      val msg = Message(syncInfoSpec, Right(getV1SyncInfo(history)), None)
+      networkControllerRef ! SendToNetwork(msg, SendToPeers(peersV1))
+    }
+    if (peersV2.nonEmpty) {
+      //todo: send only last header to peers which are equal or younger
+      val v2SyncInfo = getV2SyncInfo(history, full = true)
+      networkControllerRef ! SendToNetwork(Message(syncInfoSpec, Right(v2SyncInfo), None), SendToPeers(peersV2))
     }
   }
 
@@ -1133,7 +1148,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   /**
     * Ask peers around for NiPoPoW proofs of the chain to bootstrap
     */
-  private def requireNipopowProof(hr: ErgoHistory): Unit = {
+  private def requireNipopowProof(hr: ErgoHistory): Boolean = {
     val m = hr.P2PNipopowProofM
     val k = hr.P2PNipopowProofK
     val msg = Message(GetNipopowProofSpec, Right(NipopowProofData(m, k, None)), None)
@@ -1141,8 +1156,10 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     val peers = NipopowSupportFilter.filter(knownPeers).filter(cp => !nipopowProviders.contains(cp)).toSeq
     if (peers.nonEmpty) {
       networkControllerRef ! SendToNetwork(msg, SendToPeers(peers))
+      true
     } else {
       log.warn("No peers to ask NiPoPoWs from")
+      false
     }
   }
 
@@ -1878,6 +1895,10 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 }
 
 object ErgoNodeViewSynchronizer {
+
+  /** After this many bootstrap sync rounds with no header applied, also send an ordinary sync signal
+    * (fall back to header sync) so a node cannot stall at height 0 waiting for a NiPoPoW proof. */
+  val NipopowBootstrapFallbackRounds: Int = 3
 
   /**
     * Max number of declined transaction ids kept to not ask peers for the same transactions again. The table is
