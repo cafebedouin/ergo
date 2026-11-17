@@ -606,7 +606,7 @@ trait ErgoHistoryReader
     * @return serialized NiPoPoW proof stored under the current P2P cache key
     */
   def readPopowProofBytesFromDb(): Option[Array[Byte]] = {
-    historyStorage.getIndex(NipopowProofV2Key)
+    historyStorage.getIndex(NipopowSnapshotHeightKey)
   }
 
 }

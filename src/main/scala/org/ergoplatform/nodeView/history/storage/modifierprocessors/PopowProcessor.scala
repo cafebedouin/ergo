@@ -43,14 +43,12 @@ trait PopowProcessor extends BasicReaders with ScorexLogging {
   private lazy val nipopowVerifier =
     new NipopowVerifier(chainSettings.genesisId.orElse(bestHeaderIdAtHeight(ErgoHistoryUtils.GenesisHeight)))
 
-  private[history] val LegacyNipopowSnapshotKey: ByteArrayWrapper =
+  // The stored proof stays under the key deployed nodes use, so a proof stored before an upgrade is served
+  // after it. A proof stored by a deployed node is valid here as long as the blocks in it, other than the
+  // first of a voting epoch, hold only interlinks in their extensions
+  // (see `PoPowHeader.checkInterlinksProof(votingLength)`).
+  private[history] val NipopowSnapshotHeightKey: ByteArrayWrapper =
     ByteArrayWrapper(Array.fill(HashLength)(50: Byte))
-
-  private[history] val NipopowProofV2Key: ByteArrayWrapper =
-    ByteArrayWrapper(Array.fill(HashLength)(51: Byte))
-
-  // Periodic snapshot production and P2P reads use V2. The legacy row remains untouched.
-  protected val NipopowSnapshotHeightKey: ByteArrayWrapper = NipopowProofV2Key
 
   /**
     * Minimal superchain length ('m' in KMZ17 paper) value used in NiPoPoW proofs for bootstrapping

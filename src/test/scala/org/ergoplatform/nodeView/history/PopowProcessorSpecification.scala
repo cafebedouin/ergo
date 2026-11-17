@@ -67,32 +67,26 @@ class PopowProcessorSpecification extends ErgoCorePropertyTest with FileUtils {
 
   val toPoPoWChain = (c: Seq[ErgoFullBlock]) => c.map(b => PoPowHeader.fromBlock(b).get)
 
-  private val legacySentinel =
-    "legacy-nipopow-proof-must-not-be-served".getBytes(StandardCharsets.UTF_8)
+  private val storedByEarlierVersion =
+    "nipopow-proof-stored-by-an-earlier-version".getBytes(StandardCharsets.UTF_8)
 
-  property("legacy NiPoPoW cache bytes are ignored") {
+  property("bytes stored under the NiPoPoW proof key of earlier versions are served") {
     val history = genHistory(None, popowBootstrap = false)
     try {
-      history.LegacyNipopowSnapshotKey.data.toSeq shouldBe Seq.fill(32)(50.toByte)
-      history.NipopowProofV2Key.data.toSeq shouldBe Seq.fill(32)(51.toByte)
-      history.LegacyNipopowSnapshotKey should not equal history.NipopowProofV2Key
+      history.NipopowSnapshotHeightKey.data.toSeq shouldBe Seq.fill(32)(50.toByte)
 
       history.historyStorage.insert(
-        Array(history.LegacyNipopowSnapshotKey -> legacySentinel),
+        Array(history.NipopowSnapshotHeightKey -> storedByEarlierVersion),
         BlockSection.emptyArray
       ).get
 
-      history.readPopowProofBytesFromDb() shouldBe None
-      history.historyStorage
-        .getIndex(history.LegacyNipopowSnapshotKey)
-        .get
-        .toSeq shouldBe legacySentinel.toSeq
+      history.readPopowProofBytesFromDb().get.toSeq shouldBe storedByEarlierVersion.toSeq
     } finally {
       history.closeStorage()
     }
   }
 
-  property("V2 NiPoPoW cache miss remains empty until a scheduled snapshot") {
+  property("NiPoPoW cache miss remains empty until a scheduled snapshot") {
     val history = genHistory(None, popowBootstrap = false)
     try {
       history.readPopowProofBytesFromDb() shouldBe None
@@ -102,12 +96,12 @@ class PopowProcessorSpecification extends ErgoCorePropertyTest with FileUtils {
     }
   }
 
-  property("V2 NiPoPoW cache hit reuses byte-identical proof without generation") {
+  property("NiPoPoW cache hit reuses byte-identical proof without generation") {
     val history = genHistory(None, popowBootstrap = false)
     val cachedBytes = Array[Byte](2, 4, 6, 8)
     try {
       history.historyStorage.insert(
-        Array(history.NipopowProofV2Key -> cachedBytes),
+        Array(history.NipopowSnapshotHeightKey -> cachedBytes),
         BlockSection.emptyArray
       ).get
 
@@ -118,25 +112,7 @@ class PopowProcessorSpecification extends ErgoCorePropertyTest with FileUtils {
     }
   }
 
-  property("V2 NiPoPoW cache miss never falls back to legacy bytes") {
-    val history = genHistory(None, popowBootstrap = false)
-    try {
-      history.historyStorage.insert(
-        Array(history.LegacyNipopowSnapshotKey -> legacySentinel),
-        BlockSection.emptyArray
-      ).get
-
-      history.readPopowProofBytesFromDb() shouldBe None
-      history.historyStorage
-        .getIndex(history.LegacyNipopowSnapshotKey)
-        .get
-        .toSeq shouldBe legacySentinel.toSeq
-    } finally {
-      history.closeStorage()
-    }
-  }
-
-  property("V2 NiPoPoW cache bytes survive history restart") {
+  property("NiPoPoW cache bytes survive history restart") {
     val directory = createTempDir
     val baseSettings = ErgoNodeTestConstants.initSettings
     val historySettings = baseSettings.copy(
@@ -147,7 +123,7 @@ class PopowProcessorSpecification extends ErgoCorePropertyTest with FileUtils {
     val firstHistory = ErgoHistory.readOrGenerate(historySettings)(null)
     try {
       firstHistory.historyStorage.insert(
-        Array(firstHistory.NipopowProofV2Key -> cachedBytes),
+        Array(firstHistory.NipopowSnapshotHeightKey -> cachedBytes),
         BlockSection.emptyArray
       ).get
     } finally {
@@ -163,11 +139,11 @@ class PopowProcessorSpecification extends ErgoCorePropertyTest with FileUtils {
     }
   }
 
-  property("periodic NiPoPoW snapshots refresh V2 without rewriting legacy bytes") {
+  property("a scheduled NiPoPoW snapshot replaces the bytes stored by an earlier version") {
     val history = genHistory(None, popowBootstrap = false)
     try {
       history.historyStorage.insert(
-        Array(history.LegacyNipopowSnapshotKey -> legacySentinel),
+        Array(history.NipopowSnapshotHeightKey -> storedByEarlierVersion),
         BlockSection.emptyArray
       ).get
 
@@ -175,11 +151,9 @@ class PopowProcessorSpecification extends ErgoCorePropertyTest with FileUtils {
         .take(ErgoNodeTestConstants.settings.chainSettings.makeSnapshotEvery)
       applyChain(history, chain)
 
-      history.readPopowProofBytesFromDb().isDefined shouldBe true
-      history.historyStorage
-        .getIndex(history.LegacyNipopowSnapshotKey)
-        .get
-        .toSeq shouldBe legacySentinel.toSeq
+      val stored = history.readPopowProofBytesFromDb().get
+      stored.toSeq should not be storedByEarlierVersion.toSeq
+      history.nipopowSerializer.parseBytes(stored).isValid shouldBe true
     } finally {
       history.closeStorage()
     }
