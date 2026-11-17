@@ -1,0 +1,194 @@
+{
+  "description": "Mainnet block 1917952, the first block of a voting epoch: its PoPowHeader as a mainnet node reporting version 6.0.7-76-3c6df4b1-SNAPSHOT served it in a NiPoPoW proof on 2026-11-16 (GET /nipopow/proof/6/10), and the fields of the block's extension from the same node on 2026-11-17 (GET /blocks/{id}).",
+  "voting_length": 1024,
+  "popow_header": {
+    "header": {
+      "extensionId": "daa1e501298a4befd475569fdd1330f5034d176c2e00e7f926d0308d8f7b3ee1",
+      "difficulty": "70541230735360",
+      "votes": "080000",
+      "timestamp": 1794824985614,
+      "size": 221,
+      "unparsedBytes": "",
+      "stateRoot": "4d518fa1ba3b24242a17cf9f90c5a635a77965985ce2307dad47dd58af3c839619",
+      "height": 1917952,
+      "nBits": 104867881,
+      "version": 4,
+      "id": "1fed50c027f1614e5d7538598e11e0283fa0c77a09c6cd33e377310cb0fa028e",
+      "adProofsRoot": "7e3affdd625543e747d7dd94cf516f9a08285bc35727cddcaaa5ed433c913075",
+      "transactionsRoot": "9e094e31072f96b9e2f8c8c82635accd2ab32e9ef25c57381148f9b6cb8d96a9",
+      "extensionHash": "da798e7ab6e7d8afd773b1b07e0857efc6c6c01dd7d8ae711fc21d722d526949",
+      "powSolutions": {
+        "pk": "02bd04525e3e2bba4f910cda41ef195183c8ce8961d40fda5465ff134bdd93be59",
+        "w": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "n": "d7806b0573500f7f",
+        "d": 0
+      },
+      "adProofsId": "810eb608fd02375040720cddb2a172624f02fa97edd2f7df5ec00e13df652a04",
+      "transactionsId": "37c8314d25f60c91242f4615fe063a8f54a457e03a6e84685b6c67f8271ba89a",
+      "parentId": "9269fd8d68d9a3b725209820a3def3d1e346fb36ac2b123a49e2ded658bf70e5"
+    },
+    "interlinks": [
+      "b0244dfc267baca974a4caee06120321562784303a8a688976ae56170e4d175b",
+      "23e64616911973ff14480fe295ba32902dc426449b116df38fd46ef6de3d4093",
+      "23e64616911973ff14480fe295ba32902dc426449b116df38fd46ef6de3d4093",
+      "23e64616911973ff14480fe295ba32902dc426449b116df38fd46ef6de3d4093",
+      "23e64616911973ff14480fe295ba32902dc426449b116df38fd46ef6de3d4093",
+      "11347ec5b40da38d465f2f174e375b1d470f9a0f7f7d732fcecba8f45cf21b92",
+      "3acfee1aaf7db971990cf5e67c8a4a97dac64a4fec63d23ead17b9e880991289",
+      "3acfee1aaf7db971990cf5e67c8a4a97dac64a4fec63d23ead17b9e880991289",
+      "a9dfa46a307616381a477d3fcdefb360f8cd7948db65b200924b67959df63390",
+      "a9dfa46a307616381a477d3fcdefb360f8cd7948db65b200924b67959df63390",
+      "a9dfa46a307616381a477d3fcdefb360f8cd7948db65b200924b67959df63390",
+      "2e44c9bf25b0143c74f165ace6e733f6fd00848235cf25f327437ec04a9ff230",
+      "c930fcd746a935ce8f35babc31c4b4d4b8fbb519e7117ee190b96c13699915c3",
+      "4d5b6e1d1b25b8b72bb185d0e401f16c8b580ac872918c7e3c7d6ed2201c48d1",
+      "4d5b6e1d1b25b8b72bb185d0e401f16c8b580ac872918c7e3c7d6ed2201c48d1",
+      "4d5b6e1d1b25b8b72bb185d0e401f16c8b580ac872918c7e3c7d6ed2201c48d1",
+      "4d5b6e1d1b25b8b72bb185d0e401f16c8b580ac872918c7e3c7d6ed2201c48d1",
+      "4d5b6e1d1b25b8b72bb185d0e401f16c8b580ac872918c7e3c7d6ed2201c48d1",
+      "4d5b6e1d1b25b8b72bb185d0e401f16c8b580ac872918c7e3c7d6ed2201c48d1",
+      "4d5b6e1d1b25b8b72bb185d0e401f16c8b580ac872918c7e3c7d6ed2201c48d1",
+      "00c18e4829fe13bbca4af24d4ea9508c6ab6e0747962dd89039302d179424e6d"
+    ],
+    "interlinksProof": {
+      "indices": [
+        {
+          "index": 0,
+          "digest": "073745d6d541fe916fbc71aae2317dff6462b79a124f5cd30d34ed69064d9606"
+        },
+        {
+          "index": 1,
+          "digest": "77a965c00dc92f65d92e28ae12cae79e1e04f00165c62c4d95f8c1ca2ed34564"
+        },
+        {
+          "index": 2,
+          "digest": "c42c1dc35059d13bc25391ce111314f65a6dca3988aa4ada184554099fddda31"
+        },
+        {
+          "index": 3,
+          "digest": "1d462a974ed779ed4287a086f44f6f6a4197dd623eaa95c86c9bd9c3a6016dd9"
+        },
+        {
+          "index": 4,
+          "digest": "218c008c86c382860383f6b460821c720b1a3d118ed359366ca4913b24b8e0f7"
+        },
+        {
+          "index": 5,
+          "digest": "d5967b1bd16a4ccdb456a56c7696a95cb157729c7a92ccfd83ba595dbecf9b63"
+        },
+        {
+          "index": 6,
+          "digest": "4b3e56c762aa602b3a7cb7b96c036ebfc8fc50bce1d3ac2e306501d498a7d765"
+        },
+        {
+          "index": 7,
+          "digest": "32a77ecde0697ac16602861998199c838dfcb858f5ed9e7b1ff0e3b91270e0a4"
+        },
+        {
+          "index": 8,
+          "digest": "6906102048a1bdd51745ff1fb7ba55cbc34c592c51c09f38f4a4fa9e12d890b0"
+        }
+      ],
+      "proofs": [
+        {
+          "digest": "",
+          "side": 1
+        },
+        {
+          "digest": "",
+          "side": 1
+        },
+        {
+          "digest": "",
+          "side": 1
+        }
+      ]
+    }
+  },
+  "extension_fields": [
+    [
+      "0005",
+      "00000064"
+    ],
+    [
+      "0001",
+      "001312d0"
+    ],
+    [
+      "0006",
+      "00000967"
+    ],
+    [
+      "0009",
+      "0000001e"
+    ],
+    [
+      "0002",
+      "00000168"
+    ],
+    [
+      "0007",
+      "00000064"
+    ],
+    [
+      "0003",
+      "001364e1"
+    ],
+    [
+      "007b",
+      "00000004"
+    ],
+    [
+      "0008",
+      "0000012a"
+    ],
+    [
+      "0004",
+      "007a1643"
+    ],
+    [
+      "007c",
+      "02d701990300"
+    ],
+    [
+      "0100",
+      "01b0244dfc267baca974a4caee06120321562784303a8a688976ae56170e4d175b"
+    ],
+    [
+      "0101",
+      "0423e64616911973ff14480fe295ba32902dc426449b116df38fd46ef6de3d4093"
+    ],
+    [
+      "0105",
+      "0111347ec5b40da38d465f2f174e375b1d470f9a0f7f7d732fcecba8f45cf21b92"
+    ],
+    [
+      "0106",
+      "023acfee1aaf7db971990cf5e67c8a4a97dac64a4fec63d23ead17b9e880991289"
+    ],
+    [
+      "0108",
+      "03a9dfa46a307616381a477d3fcdefb360f8cd7948db65b200924b67959df63390"
+    ],
+    [
+      "010b",
+      "012e44c9bf25b0143c74f165ace6e733f6fd00848235cf25f327437ec04a9ff230"
+    ],
+    [
+      "010c",
+      "01c930fcd746a935ce8f35babc31c4b4d4b8fbb519e7117ee190b96c13699915c3"
+    ],
+    [
+      "010d",
+      "074d5b6e1d1b25b8b72bb185d0e401f16c8b580ac872918c7e3c7d6ed2201c48d1"
+    ],
+    [
+      "0114",
+      "0100c18e4829fe13bbca4af24d4ea9508c6ab6e0747962dd89039302d179424e6d"
+    ],
+    [
+      "0200",
+      "02d70199030307010311080103120b010310"
+    ]
+  ]
+}

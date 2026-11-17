@@ -29,6 +29,34 @@ class PoPowAlgosWithDBSpec extends AnyPropSpec with Matchers {
     proof0.prefix.map(_.id).toList shouldBe proof1.prefix.map(_.id).toList
   }
 
+  property("the interlinks proof of a block which starts a voting epoch is the interlinks-only one") {
+    val votingLength = 8
+    val blocksChain = genChain(20)
+    val h = generateHistory(true, StateType.Digest, false, 10000, 10000, 10, votingLength = Some(votingLength))
+    val hr = applyChain(h, blocksChain)
+
+    // blocks of the test chain have one extension field besides the interlinks, so the two roots differ:
+    // the root, of the two, to which the proof built for the block at a given height leads
+    def provenRoot(height: Int): String = {
+      val extension = blocksChain(height - 1).extension
+      val interlinksProof = hr.popowHeader(height).get.interlinksProof
+      (interlinksProof.valid(extension.digest), interlinksProof.valid(extension.interlinksDigest)) match {
+        case (true, false) => "extension"
+        case (false, true) => "interlinks"
+        case other => other.toString
+      }
+    }
+    Seq(votingLength - 1, votingLength, votingLength + 1, 2 * votingLength).map(provenRoot) shouldBe
+      Seq("extension", "interlinks", "extension", "interlinks")
+
+    val votingSettings = settings.chainSettings.voting.copy(votingLength = votingLength)
+    val proof = NipopowProverWithDbAlgs
+      .prove(hr, chainSettings = settings.chainSettings.copy(voting = votingSettings))(PoPowParams(m = 5, k = 6, continuous = false).get)
+      .get
+    proof.prefix.map(_.height).filter(_ % votingLength == 0) should not be empty
+    proof.isValid shouldBe true
+  }
+
   property("proof(histReader) for a header in the past") {
     val poPowParams = PoPowParams(5, 6, continuous = false).get
     val blocksChain = genChain(300)

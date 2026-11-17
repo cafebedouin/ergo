@@ -1,8 +1,9 @@
 package org.ergoplatform.modifiers.history
 
 import io.circe.{Decoder, HCursor}
-import org.ergoplatform.modifiers.history.extension.ExtensionCandidate
+import org.ergoplatform.modifiers.history.extension.{Extension, ExtensionCandidate}
 import org.ergoplatform.modifiers.history.popow.NipopowAlgos
+import org.ergoplatform.modifiers.history.popow.NipopowProof
 import org.ergoplatform.modifiers.history.popow.PoPowHeader
 import org.ergoplatform.modifiers.history.popow.PoPowHeader.checkInterlinksProof
 import org.ergoplatform.modifiers.history.popow.PoPowHeaderSerializer
@@ -117,6 +118,65 @@ class PoPowHeaderSpec extends ErgoCorePropertyTest {
         val interlinksProof = NipopowAlgos.proofForInterlinkVector(extension).get
         checkInterlinksProof(interlinks1, interlinksProof, extension.digest) shouldBe false
     }
+  }
+
+  // a proof with one header, to go through NipopowProof.hasValidProofs
+  private def proofOf(popowHeader: PoPowHeader, algos: NipopowAlgos = nipopowAlgos): NipopowProof =
+    NipopowProof(algos, 1, 1, Seq.empty, popowHeader, Seq.empty, continuous = false)
+
+  property("a proof which leads to the root of the interlinks alone, and not to the extension root, " +
+    "is accepted only for a header which starts a voting epoch") {
+    val votingLength = chainSettings.voting.votingLength
+    val interlinks = Seq(deterministicId(1), deterministicId(2))
+    val extension = mixedExtension(interlinks)
+    val wholeExtension = NipopowAlgos.proofForInterlinkVector(extension).get
+    // the root of an extension of the interlinks alone is the interlinks' root, so this is the interlinks-only proof
+    val interlinksOnly = NipopowAlgos.proofForInterlinkVector(nipopowAlgos.interlinksToExtension(interlinks)).get
+    interlinksOnly.valid(extension.interlinksDigest) shouldBe true
+    interlinksOnly.valid(extension.digest) shouldBe false
+    val otherInterlinksOnly = NipopowAlgos.proofForInterlinkVector(
+      nipopowAlgos.interlinksToExtension(Seq(deterministicId(3), deterministicId(4)))).get
+
+    forAll(defaultHeaderGen) { header =>
+      def at(height: Int, proof: BatchMerkleProof[Digest32]): NipopowProof =
+        proofOf(PoPowHeader(header.copy(height = height, extensionRoot = extension.digest), interlinks, proof))
+
+      // the first block of a voting epoch: both proofs are accepted
+      at(votingLength, interlinksOnly).hasValidProofs shouldBe true
+      at(votingLength, wholeExtension).hasValidProofs shouldBe true
+      at(2 * votingLength, interlinksOnly).hasValidProofs shouldBe true
+      // but not a proof of other interlinks than the ones shown with the header
+      at(votingLength, otherInterlinksOnly).hasValidProofs shouldBe false
+      // any other block: the proof has to lead to the extension root
+      at(votingLength - 1, interlinksOnly).hasValidProofs shouldBe false
+      at(votingLength + 1, interlinksOnly).hasValidProofs shouldBe false
+      at(votingLength + 1, wholeExtension).hasValidProofs shouldBe true
+    }
+  }
+
+  property("a voting-epoch-start header as a mainnet node serves it is accepted with its interlinks-only proof") {
+    val fixture = resourceCursor("nipopow-mainnet-voting-epoch-start-popow-header.json")
+    val votingLength = fixtureValue[Int](fixture, "voting_length")
+    val popowHeader = fixtureValue[PoPowHeader](fixture, "popow_header")
+    val extension = ExtensionCandidate(fixtureValue[Seq[(String, String)]](fixture, "extension_fields")
+      .map { case (key, value) => Base16.decode(key).get -> Base16.decode(value).get })
+    val mainnetVoting = new NipopowAlgos(chainSettings.copy(voting = chainSettings.voting.copy(votingLength = votingLength)))
+
+    // the fixture is the first block of a voting epoch with its own extension: system parameters, interlinks
+    // and validation settings
+    popowHeader.header.votingStarts(votingLength) shouldBe true
+    extension.digest.toSeq shouldBe popowHeader.header.extensionRoot.toSeq
+    NipopowAlgos.unpackInterlinks(extension.fields).get shouldBe popowHeader.interlinks
+    extension.fields.map { case (key, _) => key.head }.toSet shouldBe
+      Set(Extension.SystemParametersPrefix, Extension.InterlinksVectorPrefix, Extension.ValidationRulesPrefix)
+    // the proof served leads to the root of the interlinks alone, not to the extension root
+    popowHeader.interlinksProof.valid(extension.interlinksDigest) shouldBe true
+    popowHeader.interlinksProof.valid(extension.digest) shouldBe false
+
+    proofOf(popowHeader, mainnetVoting).hasValidProofs shouldBe true
+    // the proof against the whole extension is accepted for the same header as well
+    proofOf(popowHeader.copy(interlinksProof = NipopowAlgos.proofForInterlinkVector(extension).get), mainnetVoting)
+      .hasValidProofs shouldBe true
   }
 
   property("a mixed-extension interlinks proof is accepted against the complete header root") {
