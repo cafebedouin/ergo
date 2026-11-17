@@ -166,8 +166,9 @@ case class NipopowProof(popowAlgos: NipopowAlgos,
    * Checks the interlink proofs of the blocks in the proof.
    */
   lazy val hasValidProofs: Boolean = {
-    prefix.forall(_.checkInterlinksProof()) &&
-      suffixHead.checkInterlinksProof()
+    val votingLength = popowAlgos.chainSettings.voting.votingLength
+    prefix.forall(_.checkInterlinksProof(votingLength)) &&
+      suffixHead.checkInterlinksProof(votingLength)
   }
 
   lazy val hasValidPow: Boolean = headersChain.forall(popowAlgos.hasValidPow)

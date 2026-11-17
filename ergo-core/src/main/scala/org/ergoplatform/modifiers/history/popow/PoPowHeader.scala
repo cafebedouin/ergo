@@ -52,6 +52,25 @@ case class PoPowHeader(header: Header,
       PoPowHeader.checkInterlinksProof(interlinks, interlinksProof, header.extensionRoot)
     }
   }
+
+  /**
+    * As `checkInterlinksProof()`, and for a header which starts a voting epoch also accepts a proof which
+    * leads to the root of the interlinks alone.
+    *
+    * For a block whose extension holds nothing but interlinks the two roots are the same, so the proof deployed
+    * nodes build is a proof against the extension root already. The first block of a voting epoch has system
+    * parameters in its extension as well; there the proof deployed nodes build, and the only one they accept,
+    * leads to the root of the interlinks alone. That root is rebuilt from the interlinks shown, so a proof
+    * which leads to it does not bind them to the header; the proof against the extension root, which does,
+    * is accepted for such a header as well.
+    *
+    * @param votingLength - length of a voting epoch
+    */
+  def checkInterlinksProof(votingLength: Int): Boolean = {
+    checkInterlinksProof() || (header.votingStarts(votingLength) &&
+      PoPowHeader.hasCanonicalInterlinkRuns(interlinks) &&
+      PoPowHeader.checkInterlinksProof(interlinks, interlinksProof, PoPowHeader.interlinksOnlyRoot(interlinks)))
+  }
 }
 
 object PoPowHeader {
@@ -91,6 +110,12 @@ object PoPowHeader {
   }
 
   /**
+    * Root of the Merkle tree of the packed interlinks alone
+    */
+  def interlinksOnlyRoot(interlinks: Seq[ModifierId]): Digest32 =
+    Algos.merkleTreeRoot(Extension.merkleTree(NipopowAlgos.packInterlinks(interlinks)))
+
+  /**
     * Validates the exact packed interlink leaves against the full extension root
     */
   def checkInterlinksProof(interlinks: Seq[ModifierId],
@@ -119,7 +144,9 @@ object PoPowHeader {
   }
 
   /**
-    * Create PoPowHeader from a given block
+    * Create PoPowHeader from a given block. The interlinks proof is built against the whole extension for
+    * every block, also for the first block of a voting epoch, for which deployed nodes accept only the proof
+    * `NipopowAlgos.proofForInterlinksOnly` gives.
     */
   def fromBlock(b: ErgoFullBlock): Try[PoPowHeader] = {
     val proof = NipopowAlgos.proofForInterlinkVector(b.extension).get

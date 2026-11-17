@@ -36,6 +36,21 @@ class ExtensionCandidate(val fields: Seq[(Array[Byte], Array[Byte])]) {
       .flatMap(kv => merkleTree.proofByElement(Leaf[Digest32](LeafData @@ kv)(Algos.hash)))
 
   /**
+    * Constructs a BatchMerkleProof for interlinks against the Merkle tree of the interlink fields alone.
+    * For an extension which holds nothing but interlinks it is the same proof as `batchProofFor` gives.
+    *
+    * @param keys - array of 2-byte keys
+    * @return BatchMerkleProof or None if keys not found
+    */
+  def batchProofForInterlinks(keys: Array[Byte]*): Option[BatchMerkleProof[Digest32]] = {
+    val indices = keys.flatMap(key => fields.find(_._1 sameElements key)
+      .map(Extension.kvToLeaf)
+      .map(kv => Leaf[Digest32](LeafData @@ kv)(Algos.hash).hash)
+      .flatMap(leafData => interlinksMerkleTree.indexByElementHash(leafData)))
+    if (indices.isEmpty) None else interlinksMerkleTree.proofByIndices(indices)
+  }
+
+  /**
     * Constructs a BatchMerkleProof for the requested extension fields
     *
     * @param keys - array of 2-byte keys

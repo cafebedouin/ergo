@@ -88,7 +88,13 @@ trait PopowProcessor extends BasicReaders with ScorexLogging {
     typedModifierById[Header](headerId).flatMap(h =>
       typedModifierById[Extension](h.extensionId).flatMap { ext =>
         val interlinks = NipopowAlgos.unpackInterlinks(ext.fields).toOption
-        val interlinkProof = NipopowAlgos.proofForInterlinkVector(ext)
+        // for the first block of a voting epoch the proof stays the one deployed nodes build and accept,
+        // see `PoPowHeader.checkInterlinksProof(votingLength)`
+        val interlinkProof = if (h.votingStarts(chainSettings.voting.votingLength)) {
+          NipopowAlgos.proofForInterlinksOnly(ext)
+        } else {
+          NipopowAlgos.proofForInterlinkVector(ext)
+        }
         (interlinks, interlinkProof) match {
           case (Some(links), Some(proof)) => Some(PoPowHeader(h, links, proof))
           case _ => None

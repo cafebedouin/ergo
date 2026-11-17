@@ -228,4 +228,19 @@ object NipopowAlgos {
     }
   }
 
+  /**
+    * Proves the inclusion of the interlink vector in the Merkle Tree of the interlink fields alone. This is the
+    * proof deployed nodes build and check. It is the same proof as `proofForInterlinkVector` gives when the
+    * extension holds nothing but interlinks, and it is kept for a block which starts a voting epoch, whose
+    * extension holds system parameters too: there the two proofs differ, and deployed nodes accept only this one.
+    */
+  def proofForInterlinksOnly(ext: ExtensionCandidate): Option[BatchMerkleProof[Digest32]] = {
+    val keys = ext.fields.collect { case (key, _) if key.head == InterlinksVectorPrefix => key }
+    if (keys.isEmpty) {
+      Some(BatchMerkleProof(Seq.empty, Seq.empty)(Algos.hash))
+    } else {
+      ext.batchProofForInterlinks(keys: _*)
+    }
+  }
+
 }
