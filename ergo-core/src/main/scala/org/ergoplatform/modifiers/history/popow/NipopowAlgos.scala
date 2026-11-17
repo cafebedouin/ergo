@@ -212,16 +212,32 @@ object NipopowAlgos {
   }
 
   /**
-    * Proves the inclusion of the interlink vector in the Merkle Tree of the given extension.
+    * Proves the interlink vector held in the given extension. The proof is checked against the fields which
+    * `packInterlinks` gives for the vector (`PoPowHeader.checkInterlinksProof`). An extension is not required
+    * to hold the vector in those fields: when it holds it in others, the proof is built from the packed ones,
+    * and is then not a proof in the tree of the extension's own interlinks fields.
     */
   def proofForInterlinkVector(ext: ExtensionCandidate): Option[BatchMerkleProof[Digest32]] = {
-    val keys = ext.fields
-      .filter({ case (key, _) => key.head == InterlinksVectorPrefix })
-      .map(_._1)
-    if (keys.isEmpty) {
+    val held = ext.fields.filter { case (key, _) => key.head == InterlinksVectorPrefix }
+    val heldKeys = held.map { case (key, _) => key }
+    if (held.isEmpty) {
       Some(BatchMerkleProof(Seq.empty, Seq.empty)(Algos.hash))
     } else {
-      ext.batchProofFor(keys: _*)
+      unpackInterlinks(held) match {
+        case Success(interlinks) if interlinks.nonEmpty =>
+          val packed = packInterlinks(interlinks)
+          val heldAsPacked = held.lengthCompare(packed.size) == 0 && held.zip(packed).forall {
+            case ((heldKey, heldValue), (key, value)) => heldKey.sameElements(key) && heldValue.sameElements(value)
+          }
+          if (heldAsPacked) {
+            ext.batchProofFor(heldKeys: _*)
+          } else {
+            ExtensionCandidate(packed).batchProofFor(packed.map { case (key, _) => key }: _*)
+          }
+        case _ =>
+          // any other interlinks fields: as before
+          ext.batchProofFor(heldKeys: _*)
+      }
     }
   }
 
