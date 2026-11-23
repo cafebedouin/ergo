@@ -985,8 +985,9 @@ object CandidateGenerator extends ScorexLogging {
       } else {
         emissionAmount
       }
-      val minersAssets = if (nextHeight >= eip27ActivationHeight) {
-        // miner is getting reemission tokens
+      val minersAssets = if (nextHeight >= eip27ActivationHeight && reemissionAmount > 0) {
+        // miner is getting reemission tokens (none in the last emission epoch, where re-emission is 0:
+        // an output can not hold a token with amount 0)
         assets.append(Colls.fromItems(reemissionTokenId -> reemissionAmount))
       } else {
         assets
