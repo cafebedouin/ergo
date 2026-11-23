@@ -248,11 +248,12 @@ case class ErgoTransaction(override val inputs: IndexedSeq[Input],
         var reemissionSpending = false // flag indicating that inputs have re-emission tokens
         boxesToSpend.foreach { box =>
           // checking EIP-27 rules for emission box
-          // for efficiency, skip boxes with less than 100K ERG
-          // secure, as charging emission box will be stopped
-          // before 100K ERG left in the emission box
+          // for efficiency, skip boxes with less than 100K ERG, unless they hold the emission NFT:
+          // re-emission stops at height 2,016,000 with about 195K ERG in the emission box, which is
+          // spent down to 948 ERG by the last emission height while still holding re-emission tokens
           // todo: for efficiency, we can raise the bar probably
-          if (box.value > 100000 * EmissionRules.CoinsInOneErgo) {
+          if (box.value > 100000 * EmissionRules.CoinsInOneErgo ||
+            (height > activationHeight && box.tokens.contains(emissionNftId))) {
             // on activation height, emissionNft is not in emission box yet, but in injection box
             // injection box index (1) is enforced by injection box contract
             if (box.tokens.contains(emissionNftId) ||
